@@ -62,7 +62,7 @@ class MetricTests(unittest.TestCase):
     def reference(self) -> object:
         return AUDIT.ReferenceDocument(
             title="A Paper",
-            full_text="A Paper Introduction This method predicts stable networks Figure 1 Model A B 1 2",
+            full_text="A Paper Introduction This method predicts stable networks x y 1 Figure 1 Model A B 1 2",
             core_text="A Paper Introduction This method predicts stable networks x y 1 Figure 1 Model A B 1 2",
             headings=["A Paper", "Introduction"],
             paragraphs=["This method predicts stable networks"],

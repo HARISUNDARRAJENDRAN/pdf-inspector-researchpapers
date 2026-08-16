@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Research Paper Fast-Path Benchmark</title>
+<meta name="description" content="Benchmark the standard pdf-inspector parser against the optimized research-paper fast path locally in your browser.">
+<style>
+:root {
+  color-scheme: light;
+  --bg:#f7f7f4; --card:#fff; --ink:#171717; --muted:#6b6b66; --line:#deded8;
+  --accent:#f05a24; --accent-soft:#fff0e9; --good:#16794a; --bad:#a43228; --code:#151515;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+*{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--ink)}
+a{color:inherit}.wrap{width:min(1120px,calc(100% - 32px));margin:0 auto}.topbar{border-bottom:1px solid var(--line);background:rgba(247,247,244,.92);position:sticky;top:0;z-index:2;backdrop-filter:blur(12px)}
+.topbar .wrap{height:64px;display:flex;align-items:center;justify-content:space-between;gap:20px}.brand{font-weight:750;letter-spacing:-.02em}.brand span{color:var(--accent)}.back{font-size:14px;color:var(--muted)}
+.hero{padding:72px 0 34px}.eyebrow{font:700 12px/1.2 ui-monospace,SFMono-Regular,Menlo,monospace;text-transform:uppercase;letter-spacing:.12em;color:var(--accent)}
+h1{max-width:850px;margin:16px 0 18px;font-size:clamp(42px,7vw,76px);line-height:.98;letter-spacing:-.055em}.lede{max-width:760px;color:var(--muted);font-size:19px;line-height:1.55}.privacy{display:inline-flex;gap:8px;align-items:center;margin-top:22px;padding:9px 12px;border:1px solid var(--line);border-radius:999px;background:var(--card);font-size:13px}.dot{width:8px;height:8px;border-radius:50%;background:var(--good)}
+.grid{display:grid;grid-template-columns:1.05fr .95fr;gap:20px;padding:18px 0 64px}.card{background:var(--card);border:1px solid var(--line);border-radius:18px;overflow:hidden}.card-head{padding:18px 20px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;gap:12px;align-items:center}.card-head strong{font-size:14px}.card-body{padding:20px}
+.drop{min-height:260px;border:1.5px dashed #c8c8c1;border-radius:14px;display:grid;place-items:center;text-align:center;padding:28px;cursor:pointer;transition:.15s;background:#fbfbf9}.drop:hover,.drop.drag{border-color:var(--accent);background:var(--accent-soft)}.drop b{display:block;font-size:22px;margin-bottom:8px}.drop p{margin:0;color:var(--muted)}.drop small{display:block;margin-top:12px;color:#8b8b85}
+.controls{display:flex;gap:10px;flex-wrap:wrap;margin-top:16px}.btn{appearance:none;border:1px solid var(--line);border-radius:10px;background:#fff;color:var(--ink);height:42px;padding:0 15px;font-weight:650;cursor:pointer}.btn.primary{background:var(--ink);color:#fff;border-color:var(--ink)}.btn:disabled{opacity:.45;cursor:not-allowed}.filemeta{margin-top:16px;padding:13px 14px;border:1px solid var(--line);border-radius:12px;display:flex;justify-content:space-between;gap:14px;font-size:14px}.filemeta span:last-child{color:var(--muted)}
+.notice{margin-top:16px;padding:13px 14px;border-radius:12px;font-size:13px;line-height:1.5;background:#f3f3ef;color:var(--muted)}.notice.warn{background:#fff4d8;color:#76530b}.notice.error{background:#ffe9e6;color:var(--bad)}.notice.good{background:#eaf7ef;color:var(--good)}
+.metrics{display:grid;grid-template-columns:1fr 1fr;gap:12px}.metric{border:1px solid var(--line);border-radius:14px;padding:16px}.metric .label{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.07em}.metric .value{margin-top:8px;font-size:30px;font-weight:800;letter-spacing:-.04em}.metric .sub{margin-top:4px;font-size:12px;color:var(--muted)}.metric.hero-metric{grid-column:1/-1;background:var(--accent-soft);border-color:#ffd4c4}.metric.hero-metric .value{color:var(--accent);font-size:42px}
+.method{margin-top:14px;border-top:1px solid var(--line);padding-top:16px;color:var(--muted);font-size:13px;line-height:1.55}.statusrow{display:flex;justify-content:space-between;gap:12px;margin-bottom:14px;font-size:13px}.statusrow span:last-child{color:var(--muted)}
+.output{margin-top:20px}.output pre{max-height:330px;overflow:auto;margin:0;background:var(--code);color:#eee;padding:18px;border-radius:14px;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;word-break:break-word}.output h2{font-size:16px;margin:0 0 10px}.footer{border-top:1px solid var(--line);padding:26px 0 44px;color:var(--muted);font-size:13px}
+@media(max-width:860px){.grid{grid-template-columns:1fr}.hero{padding-top:48px}.metric .value{font-size:26px}}
+</style>
+</head>
+<body>
+<header class="topbar"><div class="wrap"><div class="brand">pdf-inspector <span>/ research benchmark</span></div><a class="back" href="./">Back to project</a></div></header>
+<main class="wrap">
+  <section class="hero">
+    <div class="eyebrow">Run it on your own paper</div>
+    <h1>Measure the research-paper fast path on your machine.</h1>
+    <p class="lede">Drop a native-text research PDF. The same Rust parser runs twice through WebAssembly: once with the normal detector and once with the trusted research-paper path that skips redundant pre-extraction classification.</p>
+    <div class="privacy"><span class="dot"></span><span>Your PDF stays in this browser. No upload, no server parser.</span></div>
+  </section>
+
+  <section class="grid">
+    <article class="card">
+      <div class="card-head"><strong>1. Choose a research PDF</strong><span id="engine">Loading WASM...</span></div>
+      <div class="card-body">
+        <input id="file" type="file" accept="application/pdf,.pdf" hidden>
+        <div id="drop" class="drop" tabindex="0" role="button" aria-label="Choose a PDF">
+          <div><b>Drop a paper here</b><p>or click to choose a PDF</p><small>Recommended: modern arXiv/native-text paper, up to 25 MB</small></div>
+        </div>
+        <div id="filemeta" class="filemeta" hidden><span id="filename"></span><span id="filesize"></span></div>
+        <div class="controls">
+          <button id="run" class="btn primary" disabled>Run benchmark</button>
+          <button id="clear" class="btn" disabled>Clear</button>
+        </div>
+        <div id="message" class="notice">The benchmark performs 3 warm-up pairs and 12 measured pairs with alternating order.</div>
+      </div>
+    </article>
+
+    <article class="card">
+      <div class="card-head"><strong>2. Results</strong><span id="progress">Waiting for a paper</span></div>
+      <div class="card-body">
+        <div class="statusrow"><span>Output equivalence</span><span id="equivalence">—</span></div>
+        <div class="metrics">
+          <div class="metric"><div class="label">Standard parser</div><div class="value" id="standard">—</div><div class="sub">median, milliseconds</div></div>
+          <div class="metric"><div class="label">Research fast path</div><div class="value" id="fast">—</div><div class="sub">median, milliseconds</div></div>
+          <div class="metric hero-metric"><div class="label">Measured improvement</div><div class="value" id="gain">—</div><div class="sub" id="gainSub">on this browser and this PDF</div></div>
+        </div>
+        <div class="method">Timing uses <code>performance.now()</code> around each WebAssembly call. Warm-ups are excluded. Measured execution order alternates between standard-first and fast-first. Results are local machine measurements, not the repository's controlled CI benchmark.</div>
+      </div>
+    </article>
+  </section>
+
+  <section id="output" class="output" hidden>
+    <h2>Markdown preview</h2>
+    <pre id="markdown"></pre>
+  </section>
+</main>
+<footer class="footer"><div class="wrap">The fast path is intended only for caller-verified native-text research PDFs. Arbitrary uploads should use the standard classification/OCR-routing path.</div></footer>
+
+<script type="module">
+import init, { processPdf, processResearchPdf, version } from "./wasm/pdf_inspector_wasm.js";
+
+const MAX = 25 * 1024 * 1024;
+const WARMUPS = 3;
+const ROUNDS = 12;
+const el = (id) => document.getElementById(id);
+const fileInput = el("file"), drop = el("drop"), run = el("run"), clear = el("clear");
+let selected = null;
+let bytes = null;
+let wasmReady = false;
+let busy = false;
+
+const fmtBytes = (n) => n < 1024 ? `${n} B` : n < 1024*1024 ? `${(n/1024).toFixed(1)} KB` : `${(n/1024/1024).toFixed(2)} MB`;
+const median = (values) => { const sorted=[...values].sort((a,b)=>a-b); const m=Math.floor(sorted.length/2); return sorted.length%2 ? sorted[m] : (sorted[m-1]+sorted[m])/2; };
+const setMessage = (text, tone="") => { el("message").textContent=text; el("message").className=`notice ${tone}`.trim(); };
+const resetResults = () => { el("standard").textContent="—"; el("fast").textContent="—"; el("gain").textContent="—"; el("equivalence").textContent="—"; el("progress").textContent="Waiting for a paper"; el("output").hidden=true; el("markdown").textContent=""; };
+
+async function loadWasm(){
+  try { await init(); wasmReady=true; el("engine").textContent=`WASM v${version()}`; if(selected) run.disabled=false; }
+  catch(err){ el("engine").textContent="WASM failed"; setMessage(`Could not load the local WebAssembly build: ${err}`,"error"); }
+}
+loadWasm();
+
+async function choose(file){
+  if(!file) return;
+  const pdf = file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
+  if(!pdf){ setMessage("Choose a PDF file.","error"); return; }
+  if(file.size > MAX){ setMessage("This public benchmark accepts PDFs up to 25 MB.","error"); return; }
+  selected=file; bytes=new Uint8Array(await file.arrayBuffer());
+  el("filename").textContent=file.name; el("filesize").textContent=fmtBytes(file.size); el("filemeta").hidden=false;
+  clear.disabled=false; run.disabled=!wasmReady; resetResults();
+  setMessage("Ready. For meaningful results, use a modern native-text research paper.");
+}
+
+function invoke(fn){
+  const started=performance.now();
+  const result=fn(bytes,{profile:"fidelity"});
+  return {ms:performance.now()-started,result};
+}
+
+async function benchmark(){
+  if(!bytes || busy || !wasmReady) return;
+  busy=true; run.disabled=true; clear.disabled=true; el("progress").textContent="Checking document...";
+  try {
+    const probe=invoke(processPdf).result;
+    const unsuitable = probe.pdfType !== "TextBased" || probe.hasEncodingIssues || (probe.pagesNeedingOcr?.length ?? 0) > 0 || typeof probe.markdown !== "string";
+    if(unsuitable){
+      setMessage(`This PDF was classified as ${probe.pdfType ?? "unknown"} or needs fallback handling. The trusted research fast path is intentionally not benchmarked on it.`,"warn");
+      el("progress").textContent="Use standard parser"; return;
+    }
+
+    el("progress").textContent="Warming up...";
+    for(let i=0;i<WARMUPS;i++){
+      if(i%2===0){ invoke(processPdf); invoke(processResearchPdf); }
+      else { invoke(processResearchPdf); invoke(processPdf); }
+      await new Promise(r=>setTimeout(r,0));
+    }
+
+    const normal=[], fast=[];
+    let standardResult=null, fastResult=null;
+    for(let i=0;i<ROUNDS;i++){
+      el("progress").textContent=`Measured round ${i+1} / ${ROUNDS}`;
+      if(i%2===0){ const a=invoke(processPdf); const b=invoke(processResearchPdf); normal.push(a.ms); fast.push(b.ms); standardResult=a.result; fastResult=b.result; }
+      else { const b=invoke(processResearchPdf); const a=invoke(processPdf); fast.push(b.ms); normal.push(a.ms); standardResult=a.result; fastResult=b.result; }
+      await new Promise(r=>setTimeout(r,0));
+    }
+
+    const same = standardResult.markdown === fastResult.markdown;
+    const normalMedian=median(normal), fastMedian=median(fast);
+    const gain=(normalMedian-fastMedian)/normalMedian*100;
+    el("standard").textContent=normalMedian.toFixed(2);
+    el("fast").textContent=fastMedian.toFixed(2);
+    el("gain").textContent=`${gain>=0?"":"−"}${Math.abs(gain).toFixed(2)}%`;
+    el("gainSub").textContent=gain>=0 ? "faster on this browser and PDF" : "slower on this browser and PDF";
+    el("equivalence").textContent=same ? "Byte-identical Markdown ✓" : "Mismatch — result rejected";
+    el("equivalence").style.color=same?"var(--good)":"var(--bad)";
+    el("progress").textContent="Complete";
+
+    if(!same){ setMessage("The two paths did not produce identical Markdown, so this timing should not be treated as a valid optimization result.","error"); return; }
+    setMessage(`Benchmark complete: ${ROUNDS} measured pairs after ${WARMUPS} warm-up pairs.`,"good");
+    el("markdown").textContent=fastResult.markdown.slice(0,12000) + (fastResult.markdown.length>12000?"\n\n… preview truncated …":"");
+    el("output").hidden=false;
+  } catch(err){
+    setMessage(err instanceof Error ? err.message : String(err),"error"); el("progress").textContent="Failed";
+  } finally { busy=false; run.disabled=!selected || !wasmReady; clear.disabled=!selected; }
+}
+
+function reset(){ if(busy) return; selected=null; bytes=null; fileInput.value=""; el("filemeta").hidden=true; run.disabled=true; clear.disabled=true; resetResults(); setMessage("The benchmark performs 3 warm-up pairs and 12 measured pairs with alternating order."); }
+
+drop.addEventListener("click",()=>fileInput.click());
+drop.addEventListener("keydown",e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();fileInput.click();}});
+drop.addEventListener("dragover",e=>{e.preventDefault();drop.classList.add("drag")});
+drop.addEventListener("dragleave",()=>drop.classList.remove("drag"));
+drop.addEventListener("drop",e=>{e.preventDefault();drop.classList.remove("drag");choose(e.dataTransfer.files[0]);});
+fileInput.addEventListener("change",()=>choose(fileInput.files[0])); run.addEventListener("click",benchmark); clear.addEventListener("click",reset);
+</script>
+</body>
+</html>

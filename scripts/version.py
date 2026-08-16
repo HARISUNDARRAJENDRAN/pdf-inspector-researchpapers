@@ -43,6 +43,9 @@ LOCK_VERSIONS = (
 SITE_WASM_VERSION = re.compile(
     r"(@firecrawl/pdf-inspector-wasm@)([^/\"]+)(/pdf_inspector_wasm\.js)"
 )
+LOCAL_SITE_WASM_MODULE = re.compile(
+    r'''(?:from\s*|import\s*\()?["]\./wasm/pdf_inspector_wasm\.js["]'''
+)
 
 
 def _read_section_version(path: Path, section: str) -> str:
@@ -73,9 +76,7 @@ def _write_section_version(path: Path, section: str, version: str) -> None:
                     f"{version_match.group(1)}{version}"
                     f"{version_match.group(2).rstrip()}"
                 )
-                lines[index] = (
-                    f"{replacement}{newline}"
-                )
+                lines[index] = f"{replacement}{newline}"
                 path.write_text("".join(lines), encoding="utf-8")
                 return
     raise ValueError(f"No version found in [{section}] of {path}")
@@ -139,9 +140,7 @@ def _bun_versions(root: Path) -> dict[str, str]:
     text = (root / "napi/bun.lock").read_text(encoding="utf-8")
     versions = {}
     for dependency in PLATFORM_PACKAGES:
-        match = re.search(
-            rf'"{re.escape(dependency)}": "([^"]+)"[,]', text
-        )
+        match = re.search(rf'"{re.escape(dependency)}": "([^"]+)"[,]', text)
         if not match:
             raise ValueError(f"Missing Bun lock dependency: {dependency}")
         versions[f"Bun lock: {dependency}"] = match.group(1)
@@ -151,9 +150,13 @@ def _bun_versions(root: Path) -> dict[str, str]:
 def _site_wasm_version(root: Path) -> str:
     text = (root / "site/index.html").read_text(encoding="utf-8")
     match = SITE_WASM_VERSION.search(text)
-    if not match:
-        raise ValueError("Missing pinned WASM package URL in site/index.html")
-    return match.group(2)
+    if match:
+        return match.group(2)
+    if LOCAL_SITE_WASM_MODULE.search(text):
+        return _read_section_version(root / "wasm/Cargo.toml", "package")
+    raise ValueError(
+        "Missing pinned WASM package URL or local WASM module in site/index.html"
+    )
 
 
 def package_versions(root: Path = ROOT) -> dict[str, str]:
@@ -223,12 +226,17 @@ def set_versions(version: str, root: Path = ROOT) -> None:
 
     site_path = root / "site/index.html"
     site_text = site_path.read_text(encoding="utf-8")
-    site_text, count = SITE_WASM_VERSION.subn(
-        rf"\g<1>{version}\g<3>", site_text, count=1
-    )
-    if count != 1:
-        raise ValueError("Missing pinned WASM package URL in site/index.html")
-    site_path.write_text(site_text, encoding="utf-8")
+    if SITE_WASM_VERSION.search(site_text):
+        site_text, count = SITE_WASM_VERSION.subn(
+            rf"\g<1>{version}\g<3>", site_text, count=1
+        )
+        if count != 1:
+            raise ValueError("Could not update pinned WASM package URL in site/index.html")
+        site_path.write_text(site_text, encoding="utf-8")
+    elif not LOCAL_SITE_WASM_MODULE.search(site_text):
+        raise ValueError(
+            "Missing pinned WASM package URL or local WASM module in site/index.html"
+        )
 
     for _, relative, package_name in LOCK_VERSIONS:
         _write_lock_version(root / relative, package_name, version)

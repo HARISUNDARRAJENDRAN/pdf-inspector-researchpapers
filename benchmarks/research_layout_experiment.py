@@ -13,9 +13,10 @@ pub(crate) fn is_newspaper_layout(
 HELPER = r'''/// Return the index of a narrow, sparse sidebar beside a primary prose column.
 ///
 /// Publisher metadata, margin notes, and similar sidebars are independent from
-/// the article's reading flow.  The geometry is intentionally conservative:
-/// exactly two columns, the narrow side must also contain fewer lines, and the
-/// body must be substantial.  No lexical/publisher-specific rules are needed.
+/// the article's reading flow. The geometry is intentionally conservative:
+/// exactly two columns, a very small narrow side, a substantial body, and the
+/// sidebar beginning materially below the body. This avoids reordering ordinary
+/// two-column legal/table layouts while handling research-paper metadata rails.
 fn sparse_sidebar_index(
     per_column_lines: &[Vec<TextLine>],
     columns: &[ColumnRegion],
@@ -31,37 +32,39 @@ fn sparse_sidebar_index(
     let counts = [per_column_lines[0].len(), per_column_lines[1].len()];
     let narrow = usize::from(widths[1] < widths[0]);
     let fewer = usize::from(counts[1] < counts[0]);
-    if narrow != fewer || counts[narrow] < 3 || counts[1 - narrow] < 15 {
+    if narrow != fewer || counts[narrow] < 3 || counts[narrow] > 8 || counts[1 - narrow] < 15 {
         return None;
     }
 
     let width_ratio = widths[narrow] / widths[1 - narrow].max(1.0);
     let line_ratio = counts[narrow] as f32 / counts[1 - narrow].max(1) as f32;
-    if width_ratio >= 0.60 || line_ratio >= 0.50 {
+    if width_ratio >= 0.60 || line_ratio >= 0.30 {
         return None;
     }
 
-    let vertical_span = |lines: &[TextLine]| -> f32 {
-        if lines.len() < 2 {
-            return 0.0;
-        }
+    let vertical_bounds = |lines: &[TextLine]| -> (f32, f32) {
         let lo = lines.iter().map(|line| line.y).fold(f32::INFINITY, f32::min);
         let hi = lines
             .iter()
             .map(|line| line.y)
             .fold(f32::NEG_INFINITY, f32::max);
-        (hi - lo).max(0.0)
+        (lo, hi)
     };
-    let narrow_span = vertical_span(&per_column_lines[narrow]);
-    let body_span = vertical_span(&per_column_lines[1 - narrow]);
-
-    // Very short sidebars are already decisive. Longer sidebars must still
-    // occupy materially less of the page than the article column.
-    if counts[narrow] <= 8 || (body_span > 0.0 && narrow_span / body_span < 0.72) {
-        Some(narrow)
-    } else {
-        None
+    let (narrow_lo, narrow_hi) = vertical_bounds(&per_column_lines[narrow]);
+    let (body_lo, body_hi) = vertical_bounds(&per_column_lines[1 - narrow]);
+    let narrow_span = (narrow_hi - narrow_lo).max(0.0);
+    let body_span = (body_hi - body_lo).max(0.0);
+    if body_span <= 0.0 {
+        return None;
     }
+
+    let span_ratio = narrow_span / body_span;
+    let top_offset_ratio = (body_hi - narrow_hi).max(0.0) / body_span;
+    if span_ratio >= 0.50 || top_offset_ratio < 0.15 {
+        return None;
+    }
+
+    Some(narrow)
 }
 
 '''

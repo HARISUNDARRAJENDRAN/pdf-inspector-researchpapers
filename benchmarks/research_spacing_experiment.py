@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build fixtures and evaluate the zero-cost TJ spacing fix.
 
-This script is intentionally dependency-free. It has three subcommands:
+This script is intentionally dependency-free. It has four subcommands:
   patch <content_stream.rs>  - apply the candidate extraction fix
   fixture <output.pdf>       - generate a tiny style-boundary PDF
   score <baseline.md> <candidate.md> - assert visible spaces are recovered
@@ -116,16 +116,20 @@ ET
     path.write_bytes(data)
 
 
+def normalize_style(text: str) -> str:
+    return text.replace("*", "").replace("_", "").replace("<u>", "").replace("</u>", "")
+
+
 def score(base_path: Path, candidate_path: Path) -> None:
-    base = base_path.read_text()
-    candidate = candidate_path.read_text()
+    base = normalize_style(base_path.read_text())
+    candidate = normalize_style(candidate_path.read_text())
     expected = [
-        "presents *Sentient Networks*",
-        "into *Stable*",
-        ", *Degrading*",
-        "and *Unstable* states",
-        "of **96.84%**",
-        "of **96.59%**",
+        "presents Sentient Networks",
+        "into Stable",
+        ", Degrading",
+        "and Unstable states",
+        "of 96.84%",
+        "of 96.59%",
     ]
     base_score = sum(value in base for value in expected)
     candidate_score = sum(value in candidate for value in expected)

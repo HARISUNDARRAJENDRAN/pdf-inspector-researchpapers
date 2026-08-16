@@ -66,7 +66,16 @@ jobs:
           set -euo pipefail
           /tmp/target-base/release/pdf2md /tmp/academic-table.pdf > /tmp/base-table.md
           /tmp/target-candidate/release/pdf2md /tmp/academic-table.pdf > /tmp/candidate-table.md
-          python3 benchmarks/research_table_experiment.py score /tmp/base-table.md /tmp/candidate-table.md
+          echo '--- baseline table ---'
+          cat /tmp/base-table.md
+          echo '--- candidate table ---'
+          cat /tmp/candidate-table.md
+          grep -F '|Predictive|Edge|Adaptive|CSI|Main Limitation|' /tmp/candidate-table.md
+          grep -F '|x|yes|yes|x|Limited-awareness|' /tmp/candidate-table.md
+          if grep -Fq '|Predictive|Edge|Adaptive|CSI|Main Limitation|' /tmp/base-table.md; then
+            echo 'baseline unexpectedly preserved the narrow CSI/final column boundary' >&2
+            exit 1
+          fi
 
       - name: Download pinned arXiv corpus
         run: |

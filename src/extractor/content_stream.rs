@@ -249,13 +249,18 @@ pub(crate) fn extract_page_text_items(
         .get_page_content(page_id)
         .map_err(|e| PdfError::Parse(e.to_string()))?;
 
-    // Strip PDF comments (% to end of line) from the content stream.
-    // Some PDF generators (e.g. PD4ML) embed comments that confuse lopdf's
-    // Content::decode parser, causing it to skip operators like ET and Q.
-    let content_data = strip_pdf_comments(&content_data);
+    // Strip PDF comments (% to end of line) only when a comment marker is
+    // actually present. Native research PDFs overwhelmingly take the clean
+    // path, so borrowing the original page bytes avoids a page-sized clone in
+    // the extraction hot path while preserving the existing string-aware
+    // comment stripper for producers that need it.
+    let stripped_content = content_data
+        .contains(&b'%')
+        .then(|| strip_pdf_comments(&content_data));
+    let content_bytes = stripped_content.as_deref().unwrap_or(&content_data);
 
     let content = match super::content_decode::decode_content_bounded(
-        &content_data,
+        content_bytes,
         super::content_decode::MAX_PAGE_OPERATIONS,
     )? {
         Some(content) => content,
@@ -633,9 +638,17 @@ pub(crate) fn extract_page_text_items(
                                         sub_start_width_ts = total_width_ts;
                                     } else {
                                         total_width_ts += displacement;
-                                        if !is_invisible
+                                        // A positioning adjustment before the first glyph belongs
+                                        // to the glyph origin, not the glyph's width. TeX/LaTeX
+                                        // commonly starts a new styled TJ array with a negative
+                                        // adjustment representing the preceding word space.
+                                        // Keeping that adjustment inside the item width makes the
+                                        // next stage see a zero inter-item gap and glue words across
+                                        // font/style boundaries.
+                                        if current_text.is_empty() {
+                                            sub_start_width_ts = total_width_ts;
+                                        } else if !is_invisible
                                             && n_val < -space_threshold
-                                            && !current_text.is_empty()
                                             && !current_text.ends_with(' ')
                                         {
                                             current_text.push(' ');
@@ -659,9 +672,17 @@ pub(crate) fn extract_page_text_items(
                                         sub_start_width_ts = total_width_ts;
                                     } else {
                                         total_width_ts += displacement;
-                                        if !is_invisible
+                                        // A positioning adjustment before the first glyph belongs
+                                        // to the glyph origin, not the glyph's width. TeX/LaTeX
+                                        // commonly starts a new styled TJ array with a negative
+                                        // adjustment representing the preceding word space.
+                                        // Keeping that adjustment inside the item width makes the
+                                        // next stage see a zero inter-item gap and glue words across
+                                        // font/style boundaries.
+                                        if current_text.is_empty() {
+                                            sub_start_width_ts = total_width_ts;
+                                        } else if !is_invisible
                                             && n_val < -space_threshold
-                                            && !current_text.is_empty()
                                             && !current_text.ends_with(' ')
                                         {
                                             current_text.push(' ');

@@ -1771,6 +1771,66 @@ pub(crate) fn filter_markdown_page_numbers_with_removed_pages(
     (items, removed_pages, remove)
 }
 
+/// Return the index of a narrow, sparse sidebar beside a primary prose column.
+///
+/// Publisher metadata, margin notes, and similar sidebars are independent from
+/// the article's reading flow. The geometry is intentionally conservative:
+/// exactly two columns, a very small narrow side, a substantial body, and the
+/// sidebar beginning materially below the body. This avoids reordering ordinary
+/// two-column legal/table layouts while handling research-paper metadata rails.
+fn sparse_sidebar_index(
+    per_column_lines: &[Vec<TextLine>],
+    columns: &[ColumnRegion],
+) -> Option<usize> {
+    if per_column_lines.len() != 2 || columns.len() != 2 {
+        return None;
+    }
+
+    let widths = [
+        columns[0].x_max - columns[0].x_min,
+        columns[1].x_max - columns[1].x_min,
+    ];
+    let counts = [per_column_lines[0].len(), per_column_lines[1].len()];
+    let narrow = usize::from(widths[1] < widths[0]);
+    let fewer = usize::from(counts[1] < counts[0]);
+    if narrow != fewer || counts[narrow] < 3 || counts[narrow] > 8 || counts[1 - narrow] < 15 {
+        return None;
+    }
+
+    let width_ratio = widths[narrow] / widths[1 - narrow].max(1.0);
+    let line_ratio = counts[narrow] as f32 / counts[1 - narrow].max(1) as f32;
+    if width_ratio >= 0.60 || line_ratio >= 0.30 {
+        return None;
+    }
+
+    let vertical_bounds = |lines: &[TextLine]| -> (f32, f32) {
+        let lo = lines
+            .iter()
+            .map(|line| line.y)
+            .fold(f32::INFINITY, f32::min);
+        let hi = lines
+            .iter()
+            .map(|line| line.y)
+            .fold(f32::NEG_INFINITY, f32::max);
+        (lo, hi)
+    };
+    let (narrow_lo, narrow_hi) = vertical_bounds(&per_column_lines[narrow]);
+    let (body_lo, body_hi) = vertical_bounds(&per_column_lines[1 - narrow]);
+    let narrow_span = (narrow_hi - narrow_lo).max(0.0);
+    let body_span = (body_hi - body_lo).max(0.0);
+    if body_span <= 0.0 {
+        return None;
+    }
+
+    let span_ratio = narrow_span / body_span;
+    let top_offset_ratio = (body_hi - narrow_hi).max(0.0) / body_span;
+    if span_ratio >= 0.50 || top_offset_ratio < 0.15 {
+        return None;
+    }
+
+    Some(narrow)
+}
+
 /// Group text items into lines, with multi-column support
 /// Detect newspaper-style columns: independent text flows that should be read
 /// sequentially (all of col1, then col2) rather than Y-interleaved.
@@ -1780,6 +1840,12 @@ pub(crate) fn is_newspaper_layout(
 ) -> bool {
     if per_column_lines.len() < 2 {
         return false;
+    }
+
+    // A sparse publisher/sidebar column is an independent flow even when it
+    // has too few lines for the dense-newspaper thresholds below.
+    if sparse_sidebar_index(per_column_lines, columns).is_some() {
+        return true;
     }
 
     // Each column must independently have substantial content
@@ -2265,6 +2331,7 @@ fn group_into_lines_with_thresholds_and_regions_impl(
             // Process spanning items as their own group
             let spanning_lines = group_single_column(spanning_items, adaptive_threshold);
 
+            let sidebar_idx = sparse_sidebar_index(&per_column_lines, &columns);
             let is_newspaper = is_newspaper_layout(&per_column_lines, &columns);
             debug!(
                 "page {}: layout={}",
@@ -2283,6 +2350,14 @@ fn group_into_lines_with_thresholds_and_regions_impl(
                     let (core, stragglers) = split_column_stragglers(col);
                     core_columns.push(core);
                     col_stragglers.push(stragglers);
+                }
+
+                // A left-hand publisher/sidebar column is supplemental context,
+                // not the primary article flow. Read the wide body first. A
+                // right-hand sidebar is already after the body in normal order.
+                if sidebar_idx == Some(0) && core_columns.len() == 2 {
+                    core_columns.swap(0, 1);
+                    col_stragglers.swap(0, 1);
                 }
 
                 // col_top = min of max Y across core columns

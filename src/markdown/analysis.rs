@@ -242,6 +242,58 @@ fn looks_title_case(t: &str) -> bool {
 pub(crate) fn is_heading_fragment(text: &str) -> bool {
     let t = text.trim_end();
 
+    // Display equations frequently use a font size/face that is rare in the
+    // document, which makes typography-only heading detection over-promote
+    // them. Strong mathematical operators are direct semantic evidence and
+    // are cheaper/more reliable than another layout pass. Keep the gate
+    // conservative: short equation-like lines only, never ordinary prose.
+    let word_count = t.split_whitespace().count();
+    let alpha_count = t.chars().filter(|c| c.is_alphabetic()).count();
+    let strong_operator = t.chars().any(|c| {
+        matches!(
+            c,
+            '=' | '<'
+                | '>'
+                | '≤'
+                | '≥'
+                | '≪'
+                | '≫'
+                | '≈'
+                | '≠'
+                | '±'
+                | '∑'
+                | '∫'
+                | '√'
+                | '∝'
+                | '∈'
+                | '∉'
+                | '∞'
+        )
+    });
+    let bracketed_math =
+        (t.contains('[') && t.contains(']')) || (t.contains('{') && t.contains('}'));
+
+    // Compact glossary/legend labels such as "H = Enthalpy (kJ/kg)" are
+    // legitimate heading fragments even though they contain '='. Preserve
+    // those while still demoting actual display equations.
+    let descriptive_definition = t.split_once('=').is_some_and(|(lhs, rhs)| {
+        let lhs = lhs.trim();
+        let rhs = rhs.trim_start();
+        !lhs.is_empty()
+            && lhs.len() <= 2
+            && lhs.chars().all(|c| c.is_ascii_uppercase())
+            && rhs.chars().next().is_some_and(|c| c.is_uppercase())
+            && rhs.chars().take_while(|c| c.is_alphabetic()).count() >= 4
+    });
+
+    if word_count <= 12
+        && (strong_operator || bracketed_math)
+        && (alpha_count <= 32 || t.contains('='))
+        && !descriptive_definition
+    {
+        return true;
+    }
+
     // A lowercase-initial one-or-two-word "heading" is a mid-sentence
     // fragment beside display math ("or inversely", "and therefore") —
     // real headings that short start uppercase. Measured as spurious

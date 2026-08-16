@@ -1,0 +1,184 @@
+name: Research paper fidelity audit
+
+on:
+  push:
+    branches: [lab/research-fidelity-audit]
+    paths:
+      - 'benchmarks/research_fidelity/**'
+      - 'src/bin/research_audit.rs'
+      - 'Cargo.toml'
+      - '.github/workflows/research-fidelity-audit.yml'
+  workflow_dispatch:
+    inputs:
+      arxiv_count:
+        description: Number of arXiv papers
+        required: false
+        default: '60'
+      pmc_count:
+        description: Number of PubMed Central papers
+        required: false
+        default: '40'
+      stress_pages:
+        description: Pages in the mixed-template latency stress PDF
+        required: false
+        default: '200'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RAYON_NUM_THREADS: '2'
+  MALLOC_ARENA_MAX: '2'
+  ARXIV_COUNT: ${{ inputs.arxiv_count || '60' }}
+  PMC_COUNT: ${{ inputs.pmc_count || '40' }}
+  STRESS_PAGES: ${{ inputs.stress_pages || '200' }}
+
+concurrency:
+  group: research-fidelity-audit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out fork
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: benchmarks/research_fidelity/requirements.txt
+
+      - name: Install source conversion tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pandoc time
+          python -m pip install --upgrade pip
+          python -m pip install -r benchmarks/research_fidelity/requirements.txt
+
+      - name: Validate audit metric code
+        run: |
+          python -m py_compile benchmarks/research_fidelity/audit.py benchmarks/research_fidelity/audit_part_*.py
+          python -m unittest benchmarks/research_fidelity/test_audit.py
+
+      - name: Validate and build fork audit binary
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/fork-target
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --bin research-audit -- -D warnings
+          cargo test --test research_paper_fast_path
+          cargo build --release --bin research-audit
+          echo "FORK_BINARY=$CARGO_TARGET_DIR/release/research-audit" >> "$GITHUB_ENV"
+
+      - name: Build latest upstream parser on the same runner
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/upstream-target
+        run: |
+          git clone --depth 1 https://github.com/firecrawl/pdf-inspector.git "${{ runner.temp }}/upstream"
+          cargo build --release --manifest-path "${{ runner.temp }}/upstream/Cargo.toml" --bin pdf2md
+          echo "UPSTREAM_BINARY=$CARGO_TARGET_DIR/release/pdf2md" >> "$GITHUB_ENV"
+          git -C "${{ runner.temp }}/upstream" rev-parse HEAD > "${{ runner.temp }}/upstream-sha.txt"
+
+      - name: Select diverse 100-paper corpus
+        run: |
+          mkdir -p "${{ runner.temp }}/research-audit/report"
+          python benchmarks/research_fidelity/audit.py select \
+            --arxiv "$ARXIV_COUNT" \
+            --pmc "$PMC_COUNT" \
+            --out "${{ runner.temp }}/research-audit/manifest.json"
+
+      - name: Download PDFs and structured source references
+        run: |
+          python benchmarks/research_fidelity/audit.py download \
+            --manifest "${{ runner.temp }}/research-audit/manifest.json" \
+            --root "${{ runner.temp }}/research-audit/corpus"
+
+      - name: Evaluate fork, research fast path, and upstream
+        run: |
+          python benchmarks/research_fidelity/audit.py evaluate \
+            --manifest "${{ runner.temp }}/research-audit/manifest.json" \
+            --root "${{ runner.temp }}/research-audit/corpus" \
+            --fork-binary "$FORK_BINARY" \
+            --upstream-binary "$UPSTREAM_BINARY" \
+            --out "${{ runner.temp }}/research-audit/results.jsonl"
+
+      - name: Summarize fidelity failures
+        run: |
+          python benchmarks/research_fidelity/audit.py summarize \
+            --results "${{ runner.temp }}/research-audit/results.jsonl" \
+            --out-dir "${{ runner.temp }}/research-audit/report"
+
+      - name: Measure 200-page scaling
+        run: |
+          python benchmarks/research_fidelity/audit.py stress \
+            --manifest "${{ runner.temp }}/research-audit/manifest.json" \
+            --root "${{ runner.temp }}/research-audit/corpus" \
+            --fork-binary "$FORK_BINARY" \
+            --out-dir "${{ runner.temp }}/research-audit/report" \
+            --pages "$STRESS_PAGES" \
+            --repeats 3
+
+          /usr/bin/time -v "$FORK_BINARY" standard \
+            "${{ runner.temp }}/research-audit/report/research-stress-${STRESS_PAGES}p.pdf" \
+            > /dev/null \
+            2> "${{ runner.temp }}/research-audit/report/resource-standard.txt"
+          /usr/bin/time -v "$FORK_BINARY" research \
+            "${{ runner.temp }}/research-audit/report/research-stress-${STRESS_PAGES}p.pdf" \
+            > /dev/null \
+            2> "${{ runner.temp }}/research-audit/report/resource-research.txt"
+          rm -f "${{ runner.temp }}/research-audit/report/research-stress-${STRESS_PAGES}p.pdf"
+
+      - name: Record reproducibility metadata
+        if: always()
+        run: |
+          {
+            echo "fork_sha=$GITHUB_SHA"
+            echo "upstream_sha=$(cat '${{ runner.temp }}/upstream-sha.txt' 2>/dev/null || echo unavailable)"
+            echo "runner_image=${ImageOS:-unknown}"
+            echo "runner_arch=$(uname -m)"
+            echo "kernel=$(uname -sr)"
+            echo "rustc=$(rustc --version 2>/dev/null || true)"
+            echo "cargo=$(cargo --version 2>/dev/null || true)"
+            echo "python=$(python --version 2>&1 || true)"
+            echo "cpu=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p' | head -1)"
+            echo "arxiv_count=$ARXIV_COUNT"
+            echo "pmc_count=$PMC_COUNT"
+            echo "stress_pages=$STRESS_PAGES"
+          } > "${{ runner.temp }}/research-audit/report/environment.txt"
+
+          cp "${{ runner.temp }}/research-audit/manifest.json" \
+             "${{ runner.temp }}/research-audit/report/manifest.json" 2>/dev/null || true
+          cp "${{ runner.temp }}/research-audit/results.jsonl" \
+             "${{ runner.temp }}/research-audit/report/results.jsonl" 2>/dev/null || true
+
+      - name: Publish summary to the Actions page
+        if: always()
+        run: |
+          if test -s "${{ runner.temp }}/research-audit/report/report.md"; then
+            cat "${{ runner.temp }}/research-audit/report/report.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'The audit stopped before a report could be generated.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload audit metrics and report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: research-fidelity-audit-${{ github.run_id }}
+          path: ${{ runner.temp }}/research-audit/report
+          if-no-files-found: warn
+          retention-days: 30

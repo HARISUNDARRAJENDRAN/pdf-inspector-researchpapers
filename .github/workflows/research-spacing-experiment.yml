@@ -1,0 +1,285 @@
+name: Research spacing experiment
+
+on:
+  push:
+    branches: [opt/research-paper-fidelity]
+    paths:
+      - .github/workflows/research-spacing-experiment.yml
+
+permissions:
+  contents: read
+
+jobs:
+  spacing-and-speed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RAYON_NUM_THREADS: "2"
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Prepare baseline and candidate worktrees
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git worktree add --detach /tmp/pdf-base origin/main
+          git worktree add --detach /tmp/pdf-candidate "$GITHUB_SHA"
+
+      - name: Apply leading-TJ spacing fix to candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('/tmp/pdf-candidate/src/extractor/content_stream.rs')
+          source = path.read_text()
+          old = '''                                    } else {
+                                        total_width_ts += displacement;
+                                        if !is_invisible
+                                            && n_val < -space_threshold
+                                            && !current_text.is_empty()
+                                            && !current_text.ends_with(' ')
+                                        {
+                                            current_text.push(' ');
+                                        }
+                                    }
+'''
+          new = '''                                    } else {
+                                        total_width_ts += displacement;
+                                        // A positioning adjustment before the first glyph belongs
+                                        // to the glyph origin, not the glyph's width. TeX/LaTeX
+                                        // commonly starts a new styled TJ array with a negative
+                                        // adjustment representing the preceding word space.
+                                        // Keeping that adjustment inside the item width makes the
+                                        // next stage see a zero inter-item gap and glue words across
+                                        // font/style boundaries.
+                                        if current_text.is_empty() {
+                                            sub_start_width_ts = total_width_ts;
+                                        } else if !is_invisible
+                                            && n_val < -space_threshold
+                                            && !current_text.ends_with(' ')
+                                        {
+                                            current_text.push(' ');
+                                        }
+                                    }
+'''
+          count = source.count(old)
+          if count != 2:
+              raise SystemExit(f'expected two TJ numeric branches, found {count}')
+          source = source.replace(old, new)
+          path.write_text(source)
+          PY
+          cd /tmp/pdf-candidate
+          cargo fmt --all
+
+      - name: Add tiny research speed driver to both worktrees
+        shell: bash
+        run: |
+          set -euo pipefail
+          for dir in /tmp/pdf-base /tmp/pdf-candidate; do
+            cat > "$dir/src/bin/research_speed.rs" <<'RS'
+          use pdf_inspector::process_research_pdf;
+          use std::env;
+          use std::time::Instant;
+
+          const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+          const FNV_PRIME: u64 = 0x100000001b3;
+
+          fn hash(mut h: u64, bytes: &[u8]) -> u64 {
+              for &b in bytes {
+                  h ^= u64::from(b);
+                  h = h.wrapping_mul(FNV_PRIME);
+              }
+              h
+          }
+
+          fn main() {
+              let paths: Vec<String> = env::args().skip(1).collect();
+              assert!(!paths.is_empty());
+              let start = Instant::now();
+              let mut digest = FNV_OFFSET;
+              let mut total = 0usize;
+              for path in paths {
+                  let out = process_research_pdf(&path).expect("parse");
+                  let md = out.markdown.expect("markdown");
+                  total += md.len();
+                  digest = hash(digest, md.as_bytes());
+              }
+              println!("{} {} {}", start.elapsed().as_nanos(), digest, total);
+          }
+          RS
+            cat >> "$dir/Cargo.toml" <<'TOML'
+
+          [[bin]]
+          name = "research-speed"
+          path = "src/bin/research_speed.rs"
+          TOML
+          done
+
+      - name: Generate exact TJ style-boundary regression PDF
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          stream = b'''BT
+          /F1 12 Tf
+          72 720 Td
+          [(This)-250(paper)-250(presents)]TJ
+          /F2 12 Tf
+          [-250(Sentient)-250(Networks)]TJ
+          /F1 12 Tf
+          [(,)-250(and)-250(classifies)-250(into)]TJ
+          /F2 12 Tf
+          [-250(Stable)]TJ
+          /F1 12 Tf
+          [(,)]TJ
+          /F2 12 Tf
+          [-250(Degrading)]TJ
+          /F1 12 Tf
+          [(,)-250(and)]TJ
+          /F2 12 Tf
+          [-250(Unstable)]TJ
+          /F1 12 Tf
+          [-250(states.)]TJ
+          0 -24 Td
+          [(accuracy)-250(of)]TJ
+          /F3 12 Tf
+          [-250(96.84%)]TJ
+          /F1 12 Tf
+          [(,)-250(precision)-250(of)]TJ
+          /F3 12 Tf
+          [-250(96.59%)]TJ
+          /F1 12 Tf
+          [(.)]TJ
+          ET
+          '''
+
+          objects = [
+              b'<< /Type /Catalog /Pages 2 0 R >>',
+              b'<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+              b'<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R /F2 5 0 R /F3 6 0 R >> >> /Contents 7 0 R >>',
+              b'<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+              b'<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Oblique >>',
+              b'<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>',
+              b'<< /Length %d >>\nstream\n' % len(stream) + stream + b'endstream',
+          ]
+          data = bytearray(b'%PDF-1.4\n')
+          offsets = [0]
+          for i, obj in enumerate(objects, 1):
+              offsets.append(len(data))
+              data += f'{i} 0 obj\n'.encode() + obj + b'\nendobj\n'
+          xref = len(data)
+          data += f'xref\n0 {len(objects)+1}\n'.encode()
+          data += b'0000000000 65535 f \n'
+          for off in offsets[1:]:
+              data += f'{off:010d} 00000 n \n'.encode()
+          data += f'trailer\n<< /Size {len(objects)+1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n'.encode()
+          Path('/tmp/style-spacing.pdf').write_bytes(data)
+          PY
+
+      - name: Build baseline and candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          CARGO_TARGET_DIR=/tmp/target-base cargo build --release --manifest-path /tmp/pdf-base/Cargo.toml --bin pdf2md --bin research-speed
+          CARGO_TARGET_DIR=/tmp/target-candidate cargo build --release --manifest-path /tmp/pdf-candidate/Cargo.toml --bin pdf2md --bin research-speed
+
+      - name: Verify spacing fidelity improvement
+        shell: bash
+        run: |
+          set -euo pipefail
+          /tmp/target-base/release/pdf2md /tmp/style-spacing.pdf > /tmp/base.md
+          /tmp/target-candidate/release/pdf2md /tmp/style-spacing.pdf > /tmp/candidate.md
+
+          echo '--- baseline ---'
+          cat /tmp/base.md
+          echo '--- candidate ---'
+          cat /tmp/candidate.md
+
+          python3 - <<'PY'
+          from pathlib import Path
+          base = Path('/tmp/base.md').read_text()
+          candidate = Path('/tmp/candidate.md').read_text()
+          expected = [
+              'presents *Sentient Networks*',
+              'into *Stable*',
+              ', *Degrading*',
+              'and *Unstable* states',
+              'of **96.84%**',
+              'of **96.59%**',
+          ]
+          base_score = sum(x in base for x in expected)
+          candidate_score = sum(x in candidate for x in expected)
+          print(f'SPACING_SCORE baseline={base_score}/{len(expected)} candidate={candidate_score}/{len(expected)}')
+          if candidate_score != len(expected):
+              raise SystemExit('candidate did not recover every expected visible word space')
+          if candidate_score <= base_score:
+              raise SystemExit('candidate did not improve spacing fidelity')
+          PY
+
+      - name: Download pinned arXiv speed corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/corpus
+          for id in 1706.03762v7 1810.04805v2 2005.14165v4 2010.11929v2 2006.11239v2; do
+            curl --fail --location --retry 4 --retry-delay 2 --user-agent 'Learnspace research parser benchmark/1.0' "https://arxiv.org/pdf/$id" -o "/tmp/corpus/$id.pdf" || \
+            curl --fail --location --retry 4 --retry-delay 2 --user-agent 'Learnspace research parser benchmark/1.0' "https://export.arxiv.org/pdf/$id" -o "/tmp/corpus/$id.pdf"
+          done
+
+      - name: Verify research fast-path speed is maintained
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import statistics, subprocess
+          from pathlib import Path
+
+          papers = [str(p) for p in sorted(Path('/tmp/corpus').glob('*.pdf'))]
+          base = '/tmp/target-base/release/research-speed'
+          cand = '/tmp/target-candidate/release/research-speed'
+
+          def run(binary):
+              out = subprocess.check_output([binary, *papers], text=True).strip().split()
+              return int(out[0]), int(out[1]), int(out[2])
+
+          for _ in range(3):
+              run(base); run(cand)
+
+          br, cr = [], []
+          for i in range(18):
+              order = (base, cand) if i % 2 == 0 else (cand, base)
+              for binary in order:
+                  ns, digest, size = run(binary)
+                  (br if binary == base else cr).append(ns)
+
+          bm = statistics.median(br)
+          cm = statistics.median(cr)
+          delta = (cm - bm) / bm * 100.0
+          print(f'SPEED baseline={bm/1e6:.3f}ms candidate={cm/1e6:.3f}ms delta={delta:+.3f}%')
+          print(f'SAMPLES baseline={[round(x/1e6,3) for x in br]}')
+          print(f'SAMPLES candidate={[round(x/1e6,3) for x in cr]}')
+          # This extraction fix adds no pass/allocation. Allow 1% CI noise;
+          # anything slower than that is rejected and must be redesigned.
+          if cm > bm * 1.01:
+              raise SystemExit(f'candidate regressed median latency by {delta:.3f}%')
+          PY
+
+      - name: Run candidate test suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/pdf-candidate
+          cargo fmt --all -- --check
+          cargo test

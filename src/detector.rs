@@ -37,6 +37,13 @@ pub enum ScanStrategy {
     /// Only scan these specific 1-indexed page numbers.
     /// Best when the caller knows which pages to check.
     Pages(Vec<u32>),
+    /// Trust the caller that the document has a usable native text layer.
+    ///
+    /// This skips classification and the detector's document-wide font scan.
+    /// Use it only for source-controlled native-text feeds such as modern
+    /// arXiv papers. Extraction still performs its normal text-quality, font,
+    /// layout, and per-page OCR checks.
+    TrustedText,
 }
 
 /// Result of PDF type detection
@@ -85,6 +92,19 @@ impl Default for DetectionConfig {
             strategy: ScanStrategy::Sample(8),
             min_text_ops_per_page: 3,
             text_page_ratio_threshold: 0.6,
+        }
+    }
+}
+
+impl DetectionConfig {
+    /// Configuration for a caller-verified native-text document.
+    ///
+    /// This is intended for controlled research-paper sources such as arXiv.
+    /// Arbitrary uploads should continue to use [`DetectionConfig::default`].
+    pub fn trusted_text() -> Self {
+        Self {
+            strategy: ScanStrategy::TrustedText,
+            ..Self::default()
         }
     }
 }
@@ -186,6 +206,20 @@ pub(crate) fn detect_from_document(
     page_count: u32,
     config: &DetectionConfig,
 ) -> Result<PdfTypeResult, PdfError> {
+    if matches!(&config.strategy, ScanStrategy::TrustedText) {
+        return Ok(PdfTypeResult {
+            pdf_type: PdfType::TextBased,
+            page_count,
+            pages_sampled: 0,
+            pages_with_text: 0,
+            confidence: 1.0,
+            title: get_document_title(doc),
+            ocr_recommended: false,
+            pages_needing_ocr: Vec::new(),
+            ocr_reasons_by_page: std::collections::BTreeMap::new(),
+        });
+    }
+
     let pages = doc.get_pages();
     let total_pages = pages.len() as u32;
 
@@ -206,6 +240,9 @@ pub(crate) fn detect_from_document(
             valid.sort();
             valid.dedup();
             (valid, false)
+        }
+        ScanStrategy::TrustedText => {
+            unreachable!("trusted-text documents return before page selection")
         }
     };
 

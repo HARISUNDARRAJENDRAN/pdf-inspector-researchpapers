@@ -110,8 +110,16 @@ def process_pdf(path: str, pages: Optional[list[int]] = None) -> PdfResult:
     """Process a PDF: detect type, extract text, convert to Markdown."""
     ...
 
+def process_research_pdf(path: str, pages: Optional[list[int]] = None) -> PdfResult:
+    """Process a caller-verified native-text research paper."""
+    ...
+
 def process_pdf_bytes(data: bytes, pages: Optional[list[int]] = None) -> PdfResult:
     """Process a PDF from bytes in memory."""
+    ...
+
+def process_research_pdf_bytes(data: bytes, pages: Optional[list[int]] = None) -> PdfResult:
+    """Process a caller-verified native-text research paper from bytes."""
     ...
 
 def detect_pdf(path: str) -> PdfResult:

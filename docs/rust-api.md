@@ -63,6 +63,17 @@ if let Some(markdown) = &result.markdown {
 }
 ```
 
+Trusted native-text research-paper fast path (for controlled sources such as modern arXiv PDFs):
+
+```rust
+use pdf_inspector::process_research_pdf;
+
+let result = process_research_pdf("paper.pdf")?;
+println!("{}", result.markdown.as_deref().unwrap_or_default());
+```
+
+This path skips pre-extraction classification and its document-wide font scan. It still runs the normal extraction, layout, text-quality, font-decoding, and per-page OCR checks. Do not use it for arbitrary uploads; use `process_pdf` for those.
+
 Fast metadata-only detection (no text extraction or markdown generation):
 
 ```rust
@@ -179,9 +190,11 @@ for item in extract_text_with_positions("tagged.pdf")? {
 | Function | Description |
 |---|---|
 | `process_pdf(path)` | Full processing with defaults |
+| `process_research_pdf(path)` | Trusted native-text research-paper processing without pre-classification |
 | `detect_pdf(path)` | Fast metadata-only detection (no extraction) |
 | `process_pdf_with_options(path, options)` | Process with custom `PdfOptions` |
 | `process_pdf_mem(bytes)` | Full processing from a byte buffer |
+| `process_research_pdf_mem(bytes)` | Trusted research-paper processing from bytes |
 | `detect_pdf_mem(bytes)` | Fast detection from a byte buffer |
 | `process_pdf_mem_with_options(bytes, options)` | Process from bytes with custom options |
 | `extract_text(path)` | Plain text extraction |
@@ -206,7 +219,7 @@ Low-level detection functions are also available via the `detector` module (`det
 | `PdfProcessResult` | Full result: pdf_type, markdown, page_count, confidence, layout, has_encoding_issues, timing |
 | `PdfTypeResult` | Low-level detection result: type, confidence, page count, pages needing OCR |
 | `DetectionConfig` | Configuration for detection: scan strategy, thresholds |
-| `ScanStrategy` | `EarlyExit`, `Full`, `Sample(n)`, `Pages(vec)` |
+| `ScanStrategy` | `EarlyExit`, `Full`, `Sample(n)`, `Pages(vec)`, `TrustedText` |
 | `LayoutComplexity` | Layout analysis: is_complex, pages_with_tables, pages_with_columns |
 | `TextItem` | Text with position, font info, page number, and optional structure-tree `mcid` |
 | `StructureElement` | Tagged-PDF structure reference: page (1-indexed), mcid, role (`"H1"`..`"H6"`, `"P"`, …) |

@@ -219,6 +219,18 @@ impl PdfOptions {
         Self::default()
     }
 
+    /// Full extraction optimized for a caller-verified native-text paper.
+    ///
+    /// The classifier and its document-wide font scan are skipped. Extraction
+    /// still runs the normal text-quality, font, layout, and OCR checks. Use
+    /// this only for controlled native-text sources such as modern arXiv PDFs.
+    pub fn research_paper() -> Self {
+        Self {
+            detection: DetectionConfig::trusted_text(),
+            ..Self::default()
+        }
+    }
+
     /// Shorthand for detect-only options.
     pub fn detect_only() -> Self {
         Self {
@@ -270,6 +282,15 @@ pub fn process_pdf<P: AsRef<Path>>(path: P) -> Result<PdfProcessResult, PdfError
     process_pdf_with_options(path, PdfOptions::new())
 }
 
+/// Process a caller-verified native-text research paper.
+///
+/// This skips classification and its document-wide font scan, then runs the
+/// same extraction, Markdown, layout, and post-extraction quality checks as
+/// [`process_pdf`]. Use the default path for arbitrary user uploads.
+pub fn process_research_pdf<P: AsRef<Path>>(path: P) -> Result<PdfProcessResult, PdfError> {
+    process_pdf_with_options(path, PdfOptions::research_paper())
+}
+
 /// Fast metadata-only detection — no text extraction or markdown generation.
 ///
 /// Equivalent to `process_pdf_with_options(path, PdfOptions::detect_only())`.
@@ -297,6 +318,13 @@ pub fn process_pdf_with_options<P: AsRef<Path>>(
 /// Process a PDF from a memory buffer with full extraction.
 pub fn process_pdf_mem(buffer: &[u8]) -> Result<PdfProcessResult, PdfError> {
     process_pdf_mem_with_options(buffer, PdfOptions::new())
+}
+
+/// Process a caller-verified native-text research paper from memory.
+///
+/// See [`process_research_pdf`] for the trust boundary and safety behavior.
+pub fn process_research_pdf_mem(buffer: &[u8]) -> Result<PdfProcessResult, PdfError> {
+    process_pdf_mem_with_options(buffer, PdfOptions::research_paper())
 }
 
 /// Fast metadata-only detection from a memory buffer.

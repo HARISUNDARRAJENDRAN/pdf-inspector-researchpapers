@@ -490,11 +490,38 @@ fn process_pdf(path: &str, pages: Option<Vec<u32>>) -> PyResult<PyPdfResult> {
     Ok(to_py_result(result))
 }
 
+/// Process a caller-verified native-text research paper.
+///
+/// Use this for controlled sources such as modern arXiv PDFs. Arbitrary
+/// uploads should use process_pdf so classification and OCR routing remain on.
+#[pyfunction]
+#[pyo3(signature = (path, pages=None))]
+fn process_research_pdf(path: &str, pages: Option<Vec<u32>>) -> PyResult<PyPdfResult> {
+    let mut opts = crate::PdfOptions::research_paper();
+    if let Some(p) = pages {
+        opts = opts.pages(p);
+    }
+    let result = crate::process_pdf_with_options(path, opts).map_err(to_py_err)?;
+    Ok(to_py_result(result))
+}
+
 /// Process a PDF from bytes in memory.
 #[pyfunction]
 #[pyo3(signature = (data, pages=None))]
 fn process_pdf_bytes(data: &[u8], pages: Option<Vec<u32>>) -> PyResult<PyPdfResult> {
     let mut opts = crate::PdfOptions::new();
+    if let Some(p) = pages {
+        opts = opts.pages(p);
+    }
+    let result = crate::process_pdf_mem_with_options(data, opts).map_err(to_py_err)?;
+    Ok(to_py_result(result))
+}
+
+/// Process a caller-verified native-text research paper from bytes.
+#[pyfunction]
+#[pyo3(signature = (data, pages=None))]
+fn process_research_pdf_bytes(data: &[u8], pages: Option<Vec<u32>>) -> PyResult<PyPdfResult> {
+    let mut opts = crate::PdfOptions::research_paper();
     if let Some(p) = pages {
         opts = opts.pages(p);
     }
@@ -713,6 +740,8 @@ fn pdf_inspector(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPagesExtractionResult>()?;
     m.add_function(wrap_pyfunction!(process_pdf, m)?)?;
     m.add_function(wrap_pyfunction!(process_pdf_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(process_research_pdf, m)?)?;
+    m.add_function(wrap_pyfunction!(process_research_pdf_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(detect_pdf, m)?)?;
     m.add_function(wrap_pyfunction!(detect_pdf_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(classify_pdf, m)?)?;

@@ -3,7 +3,13 @@ name: Deploy landing page
 on:
   push:
     branches: [main]
-    paths: ['site/**', '.github/workflows/pages.yml']
+    paths:
+      - 'site/**'
+      - 'wasm/**'
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/pages.yml'
   workflow_dispatch:
 
 permissions:
@@ -11,7 +17,6 @@ permissions:
   pages: write
   id-token: write
 
-# Allow one concurrent deployment; don't cancel an in-progress production deploy.
 concurrency:
   group: pages
   cancel-in-progress: false
@@ -25,6 +30,34 @@ jobs:
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --version 0.15.0 --locked
+
+      - name: Build browser WebAssembly from this fork
+        run: wasm-pack build wasm --target web --out-dir pkg --release
+
+      - name: Stage WebAssembly with the static site
+        run: |
+          rm -rf site/wasm
+          mkdir -p site/wasm
+          cp wasm/pkg/pdf_inspector_wasm.js site/wasm/
+          cp wasm/pkg/pdf_inspector_wasm_bg.wasm site/wasm/
+          cp wasm/pkg/pdf_inspector_wasm.d.ts site/wasm/ 2>/dev/null || true
+          cp wasm/pkg/pdf_inspector_wasm_bg.wasm.d.ts site/wasm/ 2>/dev/null || true
+
+      - name: Verify benchmark assets
+        run: |
+          test -s site/benchmark.html
+          test -s site/wasm/pdf_inspector_wasm.js
+          test -s site/wasm/pdf_inspector_wasm_bg.wasm
+          grep -q 'processResearchPdf' site/wasm/pdf_inspector_wasm.js
 
       - name: Upload site artifact
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0

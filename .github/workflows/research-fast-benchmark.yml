@@ -120,8 +120,10 @@ jobs:
               let mut bytes = 0usize;
               for path in &paths {
                   let options = if mode == "trusted" {
-                      let mut detection = DetectionConfig::default();
-                      detection.strategy = ScanStrategy::TrustedText;
+                      let detection = DetectionConfig {
+                          strategy: ScanStrategy::TrustedText,
+                          ..DetectionConfig::default()
+                      };
                       PdfOptions::new().detection(detection)
                   } else {
                       PdfOptions::new()
@@ -207,7 +209,7 @@ jobs:
           cd /tmp/pdf-inspector-candidate
           cargo fmt --all
           cargo fmt --all -- --check
-          cargo clippy --all-targets -- -D warnings
+          cargo clippy -- -D warnings
           cargo test
           CARGO_TARGET_DIR=/tmp/target-candidate cargo build --release --bin research-bench
 

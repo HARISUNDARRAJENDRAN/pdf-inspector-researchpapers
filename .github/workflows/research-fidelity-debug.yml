@@ -1,0 +1,76 @@
+name: Inspect arXiv HTML ground truth
+
+on:
+  push:
+    branches: [lab/research-fidelity-audit]
+    paths:
+      - '.github/workflows/research-fidelity-debug.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r benchmarks/research_fidelity/requirements.txt
+      - name: Inspect representative arXiv HTML documents
+        run: |
+          python - <<'PY' | tee /tmp/arxiv-html-debug.txt
+          import importlib.util
+          import pathlib
+          import requests
+          import sys
+          from lxml import html, etree
+
+          module_path = pathlib.Path('benchmarks/research_fidelity/audit.py')
+          spec = importlib.util.spec_from_file_location('research_audit_debug', module_path)
+          audit = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = audit
+          spec.loader.exec_module(audit)
+
+          for paper_id in ('2401.04000v4', '2401.04071v4', '2401.08414v1'):
+              response = requests.get(
+                  f'https://arxiv.org/html/{paper_id}',
+                  headers={'User-Agent': audit.USER_AGENT},
+                  timeout=90,
+              )
+              response.raise_for_status()
+              path = pathlib.Path('/tmp') / f'{paper_id}.html'
+              path.write_bytes(response.content)
+              document = html.fromstring(response.content)
+              print('\n===', paper_id, '===')
+              print('bytes', len(response.content), 'title', document.xpath('string(//title)'))
+              print('p', len(document.xpath('//p')))
+              print('ltx_p', len(document.xpath("//*[contains(concat(' ', normalize-space(@class), ' '), ' ltx_p ')]")))
+              print('ltx_para', len(document.xpath("//*[contains(concat(' ', normalize-space(@class), ' '), ' ltx_para ')]")))
+              print('headings', len(document.xpath('//h1 | //h2 | //h3 | //h4 | //h5 | //h6')))
+              print('tables', len(document.xpath('//table')), 'math', len(document.xpath('//math')))
+              print('articles', [(node.tag, node.attrib.get('class')) for node in document.xpath('//article')[:5]])
+              reference = audit.parse_arxiv_html(path)
+              print('reference full/core words', len(audit.word_tokens(reference.full_text)), len(audit.word_tokens(reference.core_text)))
+              print('paragraphs/headings/captions/tables/equations', len(reference.paragraphs), len(reference.headings), len(reference.captions), len(reference.tables), len(reference.equations))
+              print('core start', reference.core_text[:700].replace('\n', ' | '))
+              print('core end', reference.core_text[-700:].replace('\n', ' | '))
+              paras = document.xpath('//p')
+              for index, node in enumerate(paras[:3]):
+                  ancestors = [a.attrib.get('class', '') for a in node.iterancestors()]
+                  print('p', index, 'class=', node.attrib.get('class'), 'ancestors=', ancestors[:6], 'text=', audit.element_text(node)[:240])
+              ltx_paras = document.xpath("//*[contains(concat(' ', normalize-space(@class), ' '), ' ltx_para ')]")
+              for index, node in enumerate(ltx_paras[:3]):
+                  print('ltx_para', index, 'tag=', node.tag, 'class=', node.attrib.get('class'), 'text=', audit.element_text(node)[:300])
+              sections = document.xpath("//*[contains(concat(' ', normalize-space(@class), ' '), ' ltx_section ')]")
+              if sections:
+                  print('first section html', etree.tostring(sections[0], encoding='unicode')[:1200].replace('\n', ' '))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arxiv-html-debug-${{ github.run_id }}
+          path: /tmp/arxiv-html-debug.txt
+          retention-days: 7

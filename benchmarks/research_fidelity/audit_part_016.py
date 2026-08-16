@@ -51,7 +51,10 @@ def _is_arxiv_core_prose(node: Any) -> bool:
         return False
     if _has_ancestor_class(node, "ltx_authors"):
         return False
-    if any(local_name(ancestor.tag) in {"table", "figure", "figcaption"} for ancestor in node.iterancestors()):
+    if any(
+        local_name(ancestor.tag) in {"table", "figure", "figcaption"}
+        for ancestor in node.iterancestors()
+    ):
         return False
     return True
 
@@ -72,9 +75,7 @@ def parse_arxiv_html(path: pathlib.Path) -> ReferenceDocument:
     headings = unique_nonempty(element_text(node) for node in heading_nodes)
 
     paragraph_nodes = [
-        node
-        for node in article.xpath(".//p")
-        if _is_arxiv_core_prose(node)
+        node for node in article.xpath(".//p") if _is_arxiv_core_prose(node)
     ]
     paragraphs = unique_nonempty(element_text(node) for node in paragraph_nodes)
 
@@ -104,7 +105,8 @@ def parse_arxiv_html(path: pathlib.Path) -> ReferenceDocument:
 
     # Build the high-confidence article body in DOM order. Bibliography entries
     # remain in full_text for precision, but are not required for body recall.
-    data_table_ids = {id(table) for table in data_table_nodes}
+    tree = article.getroottree()
+    data_table_paths = {tree.getpath(table) for table in data_table_nodes}
     core_blocks: list[str] = []
     nodes = article.xpath(
         ".//h1 | .//h2 | .//h3 | .//h4 | .//h5 | .//h6 | "
@@ -115,8 +117,15 @@ def parse_arxiv_html(path: pathlib.Path) -> ReferenceDocument:
         if tag == "p" and not _is_arxiv_core_prose(node):
             continue
         if tag == "tr":
-            owner = next((ancestor for ancestor in node.iterancestors() if local_name(ancestor.tag) == "table"), None)
-            if owner is None or id(owner) not in data_table_ids:
+            owner = next(
+                (
+                    ancestor
+                    for ancestor in node.iterancestors()
+                    if local_name(ancestor.tag) == "table"
+                ),
+                None,
+            )
+            if owner is None or tree.getpath(owner) not in data_table_paths:
                 continue
         if tag in {"h1", "h2", "h3", "h4", "h5", "h6"} and _has_ancestor_class(
             node, "ltx_bibliography"
@@ -157,11 +166,18 @@ def parse_reference(paper: dict[str, Any], directory: pathlib.Path) -> Reference
     html_path = directory / "reference.html"
     source_path = directory / "source.bin"
     if paper.get("provider") == "arxiv" and html_path.exists():
-        reference = parse_arxiv_html(html_path)
-        page_count = int(paper.get("page_count") or count_pdf_pages(directory / "paper.pdf"))
-        aligned, reason = arxiv_reference_alignment(reference, paper, page_count)
+        try:
+            reference = parse_arxiv_html(html_path)
+            page_count = int(
+                paper.get("page_count") or count_pdf_pages(directory / "paper.pdf")
+            )
+            aligned, reason = arxiv_reference_alignment(reference, paper, page_count)
+        except Exception as exc:
+            reference = None
+            aligned = False
+            reason = f"HTML reference parse failed: {exc}"
         paper["arxiv_html_alignment"] = reason
-        if aligned:
+        if aligned and reference is not None:
             return reference
         if source_path.exists():
             return parse_latex_source(source_path)

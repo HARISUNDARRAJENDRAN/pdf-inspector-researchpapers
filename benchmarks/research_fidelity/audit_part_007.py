@@ -12,7 +12,7 @@ _download_arxiv_before_alignment = download_arxiv
 
 
 def arxiv_reference_alignment(
-    reference: ReferenceDocument,
+    reference: "ReferenceDocument",
     paper: dict[str, Any],
     page_count: int,
 ) -> tuple[bool, str]:

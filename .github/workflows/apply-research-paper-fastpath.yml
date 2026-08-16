@@ -29,7 +29,11 @@ jobs:
           targets: wasm32-unknown-unknown
 
       - name: Apply source changes
-        run: python3 scripts/apply_research_fastpath.py
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/apply_research_fastpath.py
+          python3 scripts/fix_research_fastpath_tests.py
 
       - name: Validate native, Python, and WASM builds
         shell: bash

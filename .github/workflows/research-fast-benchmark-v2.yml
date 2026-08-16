@@ -170,6 +170,8 @@ jobs:
           source = path.read_text()
 
           enum_anchor = '''    /// Only scan these specific 1-indexed page numbers.\n    /// Best when the caller knows which pages to check.\n    Pages(Vec<u32>),\n'''
+          if enum_anchor not in source:
+              raise SystemExit('ScanStrategy enum anchor not found')
           source = source.replace(
               enum_anchor,
               enum_anchor + '''    /// Trust the caller that the input is a native-text document.\n    /// Skips classification and OCR-routing scans entirely. Intended for\n    /// source-controlled research-paper feeds such as arXiv.\n    TrustedText,\n''',
@@ -177,24 +179,20 @@ jobs:
           )
 
           function_anchor = '''pub(crate) fn detect_from_document(\n    doc: &Document,\n    page_count: u32,\n    config: &DetectionConfig,\n) -> Result<PdfTypeResult, PdfError> {\n    let pages = doc.get_pages();\n'''
+          if function_anchor not in source:
+              raise SystemExit('detect_from_document anchor not found')
           function_replacement = '''pub(crate) fn detect_from_document(\n    doc: &Document,\n    page_count: u32,\n    config: &DetectionConfig,\n) -> Result<PdfTypeResult, PdfError> {\n    if matches!(&config.strategy, ScanStrategy::TrustedText) {\n        return Ok(PdfTypeResult {\n            pdf_type: PdfType::TextBased,\n            page_count,\n            pages_sampled: 0,\n            pages_with_text: 0,\n            confidence: 1.0,\n            title: get_document_title(doc),\n            ocr_recommended: false,\n            pages_needing_ocr: Vec::new(),\n            ocr_reasons_by_page: std::collections::BTreeMap::new(),\n        });\n    }\n\n    let pages = doc.get_pages();\n'''
           source = source.replace(function_anchor, function_replacement, 1)
 
           match_anchor = '''        ScanStrategy::Pages(pages) => {\n            let mut valid: Vec<u32> = pages\n                .iter()\n                .copied()\n                .filter(|&p| p >= 1 && p <= total_pages)\n                .collect();\n            valid.sort();\n            valid.dedup();\n            (valid, false)\n        }\n'''
+          if match_anchor not in source:
+              raise SystemExit('ScanStrategy match anchor not found')
           source = source.replace(
               match_anchor,
               match_anchor
               + '''        ScanStrategy::TrustedText => unreachable!("trusted-text exits before page selection"),\n''',
               1,
           )
-
-          for anchor, label in (
-              (enum_anchor, 'enum'),
-              (function_anchor, 'function'),
-              (match_anchor, 'match'),
-          ):
-              if anchor in source:
-                  raise SystemExit(f'{label} patch did not apply')
 
           path.write_text(source)
           PY

@@ -157,10 +157,24 @@ jobs:
           cargo clippy -- -D warnings
 
       - name: Validate production tests
+        id: production_tests
+        continue-on-error: true
         run: |
-          set -euo pipefail
+          set -o pipefail
           cd /tmp/pdf-candidate
-          cargo test --verbose
+          cargo test --verbose 2>&1 | tee /tmp/production-tests.log
+
+      - name: Upload production test log
+        if: steps.production_tests.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-test-log
+          path: /tmp/production-tests.log
+          retention-days: 1
+
+      - name: Gate production tests
+        if: steps.production_tests.outcome == 'failure'
+        run: exit 1
 
       - name: Validate root WebAssembly target
         run: |

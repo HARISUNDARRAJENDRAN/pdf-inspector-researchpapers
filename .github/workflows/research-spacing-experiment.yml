@@ -138,15 +138,46 @@ jobs:
       - name: Verify research fast-path speed is maintained
         run: python3 benchmarks/research_spacing_experiment.py speed /tmp/target-base/release/research-speed /tmp/target-candidate/release/research-speed /tmp/corpus/*.pdf
 
-      - name: Run production validation
+      - name: Remove benchmark-only driver before production validation
+        run: |
+          set -euo pipefail
+          rm -f /tmp/pdf-candidate/src/bin/research_speed.rs
+          git -C /tmp/pdf-candidate restore Cargo.toml
+
+      - name: Validate production formatting
         run: |
           set -euo pipefail
           cd /tmp/pdf-candidate
           cargo fmt --all -- --check
+
+      - name: Validate production clippy
+        run: |
+          set -euo pipefail
+          cd /tmp/pdf-candidate
           cargo clippy -- -D warnings
+
+      - name: Validate production tests
+        run: |
+          set -euo pipefail
+          cd /tmp/pdf-candidate
           cargo test --verbose
+
+      - name: Validate root WebAssembly target
+        run: |
+          set -euo pipefail
+          cd /tmp/pdf-candidate
           cargo check --target wasm32-unknown-unknown
+
+      - name: Validate browser WebAssembly crate
+        run: |
+          set -euo pipefail
+          cd /tmp/pdf-candidate
           cargo check --manifest-path wasm/Cargo.toml --target wasm32-unknown-unknown
+
+      - name: Validate production diff
+        run: |
+          set -euo pipefail
+          cd /tmp/pdf-candidate
           git diff --check
 
       - name: Publish clean validated release branch

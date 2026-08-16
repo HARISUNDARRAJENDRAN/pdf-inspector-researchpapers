@@ -1,0 +1,4 @@
+
+[[bin]]
+name = "research-speed"
+path = "src/bin/research_speed.rs"

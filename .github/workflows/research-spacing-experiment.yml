@@ -31,6 +31,7 @@ jobs:
           git worktree add --detach /tmp/pdf-base origin/main
           git worktree add --detach /tmp/pdf-candidate "$GITHUB_SHA"
           python3 benchmarks/research_spacing_experiment.py patch /tmp/pdf-candidate/src/extractor/content_stream.rs
+          python3 benchmarks/research_speed_optimizations.py /tmp/pdf-candidate/src/extractor/content_stream.rs
           python3 benchmarks/research_table_experiment.py patch /tmp/pdf-candidate/src/tables/grid.rs
           cd /tmp/pdf-candidate
           cargo fmt --all

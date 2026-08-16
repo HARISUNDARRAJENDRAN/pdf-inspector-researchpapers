@@ -19,10 +19,12 @@ class ReferenceParsingTests(unittest.TestCase):
         html = """
         <html><body><article class="ltx_document">
           <h1 class="ltx_title_document">A Paper</h1>
+          <div class="ltx_authors">Ada Author, Example University</div>
           <h2>1 Introduction</h2>
           <p>This is a paragraph with <math alttext="x = y + 1">x=y+1</math>.</p>
           <figure><figcaption>Figure 1: Model.</figcaption></figure>
           <table><tr><th>A</th><th>B</th></tr><tr><td>1</td><td>2</td></tr></table>
+          <table class="ltx_eqn_table ltx_equation"><tr><td>x = y + 1</td></tr></table>
         </article></body></html>
         """
         with tempfile.TemporaryDirectory() as tmp:
@@ -31,13 +33,16 @@ class ReferenceParsingTests(unittest.TestCase):
             reference = AUDIT.parse_arxiv_html(path)
         self.assertEqual(reference.title, "A Paper")
         self.assertIn("1 Introduction", reference.headings)
+        self.assertEqual(len(reference.tables), 1)
         self.assertEqual(reference.tables[0][1], ["1", "2"])
         self.assertIn("x = y + 1", reference.equations)
+        self.assertIn("Ada Author", reference.full_text)
 
     def test_pmc_jats_structure(self) -> None:
         xml = """
         <article xmlns:mml="http://www.w3.org/1998/Math/MathML">
           <front><article-meta><title-group><article-title>JATS Paper</article-title></title-group>
+          <contrib-group><contrib><name><surname>Author</surname><given-names>Ada</given-names></name></contrib></contrib-group>
           <abstract><p>Abstract text.</p></abstract></article-meta></front>
           <body><sec><title>Methods</title><p>Method text.</p>
           <fig><caption><p>Fig 1. Result.</p></caption></fig>
@@ -56,6 +61,7 @@ class ReferenceParsingTests(unittest.TestCase):
         self.assertEqual(reference.headings, ["Methods"])
         self.assertEqual(reference.tables[0][1], ["x", "y"])
         self.assertIn("x = 1", reference.equations)
+        self.assertIn("Author Ada", reference.full_text)
 
 
 class MetricTests(unittest.TestCase):

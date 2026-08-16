@@ -1,0 +1,345 @@
+name: Research paper fast-path benchmark v2
+
+on:
+  push:
+    branches:
+      - opt/research-paper-fastpath
+    paths:
+      - .github/workflows/research-fast-benchmark-v2.yml
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUST_BACKTRACE: "1"
+      RAYON_NUM_THREADS: "2"
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Prepare baseline and candidate worktrees
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git worktree add --detach /tmp/base origin/main
+          git worktree add --detach /tmp/candidate "$GITHUB_SHA"
+
+      - name: Install paired benchmark drivers
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > /tmp/base/src/bin/research_bench.rs <<'RS'
+          use pdf_inspector::{process_pdf_with_options, PdfOptions};
+          use std::env;
+          use std::time::Instant;
+
+          const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+          const FNV_PRIME: u64 = 0x100000001b3;
+
+          fn update_hash(mut hash: u64, bytes: &[u8]) -> u64 {
+              for &byte in bytes {
+                  hash ^= u64::from(byte);
+                  hash = hash.wrapping_mul(FNV_PRIME);
+              }
+              hash
+          }
+
+          fn main() {
+              let mut args = env::args().skip(1);
+              let _mode = args.next().expect("mode argument");
+              let paths: Vec<String> = args.collect();
+              assert!(!paths.is_empty(), "at least one PDF path is required");
+
+              let started = Instant::now();
+              let mut hash = FNV_OFFSET;
+              let mut bytes = 0usize;
+              for path in &paths {
+                  let result = process_pdf_with_options(path, PdfOptions::new())
+                      .unwrap_or_else(|error| panic!("failed to parse {path}: {error}"));
+                  let markdown = result.markdown.unwrap_or_else(|| {
+                      panic!(
+                          "{path} produced no markdown (classified {:?})",
+                          result.pdf_type
+                      )
+                  });
+                  bytes += markdown.len();
+                  hash = update_hash(hash, markdown.as_bytes());
+              }
+              println!(
+                  "{} {} {} {}",
+                  started.elapsed().as_nanos(),
+                  hash,
+                  bytes,
+                  paths.len()
+              );
+          }
+          RS
+
+          cat >> /tmp/base/Cargo.toml <<'TOML'
+
+          [[bin]]
+          name = "research-bench"
+          path = "src/bin/research_bench.rs"
+          TOML
+
+          cat > /tmp/candidate/src/bin/research_bench.rs <<'RS'
+          use pdf_inspector::{
+              process_pdf_with_options, DetectionConfig, PdfOptions, ScanStrategy,
+          };
+          use std::env;
+          use std::time::Instant;
+
+          const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+          const FNV_PRIME: u64 = 0x100000001b3;
+
+          fn update_hash(mut hash: u64, bytes: &[u8]) -> u64 {
+              for &byte in bytes {
+                  hash ^= u64::from(byte);
+                  hash = hash.wrapping_mul(FNV_PRIME);
+              }
+              hash
+          }
+
+          fn main() {
+              let mut args = env::args().skip(1);
+              let mode = args.next().expect("mode argument");
+              let paths: Vec<String> = args.collect();
+              assert!(!paths.is_empty(), "at least one PDF path is required");
+
+              let started = Instant::now();
+              let mut hash = FNV_OFFSET;
+              let mut bytes = 0usize;
+              for path in &paths {
+                  let options = if mode == "trusted" {
+                      let detection = DetectionConfig {
+                          strategy: ScanStrategy::TrustedText,
+                          ..DetectionConfig::default()
+                      };
+                      PdfOptions::new().detection(detection)
+                  } else {
+                      PdfOptions::new()
+                  };
+                  let result = process_pdf_with_options(path, options)
+                      .unwrap_or_else(|error| panic!("failed to parse {path}: {error}"));
+                  let markdown = result.markdown.unwrap_or_else(|| {
+                      panic!(
+                          "{path} produced no markdown (classified {:?})",
+                          result.pdf_type
+                      )
+                  });
+                  bytes += markdown.len();
+                  hash = update_hash(hash, markdown.as_bytes());
+              }
+              println!(
+                  "{} {} {} {}",
+                  started.elapsed().as_nanos(),
+                  hash,
+                  bytes,
+                  paths.len()
+              );
+          }
+          RS
+
+          cat >> /tmp/candidate/Cargo.toml <<'TOML'
+
+          [[bin]]
+          name = "research-bench"
+          path = "src/bin/research_bench.rs"
+          TOML
+
+      - name: Apply trusted native-text fast path to candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('/tmp/candidate/src/detector.rs')
+          source = path.read_text()
+
+          enum_anchor = '''    /// Only scan these specific 1-indexed page numbers.\n    /// Best when the caller knows which pages to check.\n    Pages(Vec<u32>),\n'''
+          source = source.replace(
+              enum_anchor,
+              enum_anchor + '''    /// Trust the caller that the input is a native-text document.\n    /// Skips classification and OCR-routing scans entirely. Intended for\n    /// source-controlled research-paper feeds such as arXiv.\n    TrustedText,\n''',
+              1,
+          )
+
+          function_anchor = '''pub(crate) fn detect_from_document(\n    doc: &Document,\n    page_count: u32,\n    config: &DetectionConfig,\n) -> Result<PdfTypeResult, PdfError> {\n    let pages = doc.get_pages();\n'''
+          function_replacement = '''pub(crate) fn detect_from_document(\n    doc: &Document,\n    page_count: u32,\n    config: &DetectionConfig,\n) -> Result<PdfTypeResult, PdfError> {\n    if matches!(&config.strategy, ScanStrategy::TrustedText) {\n        return Ok(PdfTypeResult {\n            pdf_type: PdfType::TextBased,\n            page_count,\n            pages_sampled: 0,\n            pages_with_text: 0,\n            confidence: 1.0,\n            title: get_document_title(doc),\n            ocr_recommended: false,\n            pages_needing_ocr: Vec::new(),\n            ocr_reasons_by_page: std::collections::BTreeMap::new(),\n        });\n    }\n\n    let pages = doc.get_pages();\n'''
+          source = source.replace(function_anchor, function_replacement, 1)
+
+          match_anchor = '''        ScanStrategy::Pages(pages) => {\n            let mut valid: Vec<u32> = pages\n                .iter()\n                .copied()\n                .filter(|&p| p >= 1 && p <= total_pages)\n                .collect();\n            valid.sort();\n            valid.dedup();\n            (valid, false)\n        }\n'''
+          source = source.replace(
+              match_anchor,
+              match_anchor
+              + '''        ScanStrategy::TrustedText => unreachable!("trusted-text exits before page selection"),\n''',
+              1,
+          )
+
+          for anchor, label in (
+              (enum_anchor, 'enum'),
+              (function_anchor, 'function'),
+              (match_anchor, 'match'),
+          ):
+              if anchor in source:
+                  raise SystemExit(f'{label} patch did not apply')
+
+          path.write_text(source)
+          PY
+
+      - name: Download pinned arXiv corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/corpus
+          for id in 1706.03762v7 1810.04805v2 2005.14165v4 2010.11929v2 2006.11239v2; do
+            curl --fail --location --retry 4 --retry-delay 2 \
+              --user-agent "Learnspace PDF benchmark/1.0" \
+              "https://arxiv.org/pdf/${id}" \
+              --output "/tmp/corpus/${id}.pdf"
+          done
+          ls -lh /tmp/corpus
+
+      - name: Validate candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/candidate
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo clippy -- -D warnings
+          cargo test
+          CARGO_TARGET_DIR=/tmp/target-candidate cargo build --release --bin research-bench
+
+      - name: Build untouched main baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/base
+          CARGO_TARGET_DIR=/tmp/target-base cargo build --release --bin research-bench
+
+      - name: Benchmark and verify output identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import statistics
+          import subprocess
+          from pathlib import Path
+
+          papers = sorted(str(path) for path in Path('/tmp/corpus').glob('*.pdf'))
+          base = '/tmp/target-base/release/research-bench'
+          candidate = '/tmp/target-candidate/release/research-bench'
+
+          def run(binary, mode):
+              completed = subprocess.run(
+                  [binary, mode, *papers],
+                  check=False,
+                  text=True,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  env=os.environ.copy(),
+              )
+              if completed.returncode != 0:
+                  raise RuntimeError(
+                      f'{binary} {mode} failed with exit {completed.returncode}\n'
+                      f'stdout:\n{completed.stdout}\n'
+                      f'stderr:\n{completed.stderr}'
+                  )
+              elapsed_ns, digest, byte_count, document_count = completed.stdout.strip().split()
+              return int(elapsed_ns), (int(digest), int(byte_count), int(document_count))
+
+          for _ in range(3):
+              run(base, 'default')
+              run(candidate, 'default')
+              run(candidate, 'trusted')
+
+          baseline = []
+          normal = []
+          trusted = []
+          signature = None
+          orders = [
+              ((base, 'default', baseline), (candidate, 'default', normal), (candidate, 'trusted', trusted)),
+              ((candidate, 'trusted', trusted), (base, 'default', baseline), (candidate, 'default', normal)),
+              ((candidate, 'default', normal), (candidate, 'trusted', trusted), (base, 'default', baseline)),
+          ]
+
+          for index in range(18):
+              for binary, mode, bucket in orders[index % 3]:
+                  elapsed, current = run(binary, mode)
+                  if signature is None:
+                      signature = current
+                  elif current != signature:
+                      raise RuntimeError(
+                          f'Markdown mismatch: expected {signature}, got {current} for {mode}'
+                      )
+                  bucket.append(elapsed)
+
+          med_base = statistics.median(baseline)
+          med_normal = statistics.median(normal)
+          med_trusted = statistics.median(trusted)
+          algorithm_gain = (med_normal - med_trusted) / med_normal
+          total_gain = (med_base - med_trusted) / med_base
+
+          result = {
+              'documents': len(papers),
+              'rounds': len(trusted),
+              'markdown_hash_fnv1a64': signature[0],
+              'markdown_bytes': signature[1],
+              'baseline_main_median_ms': med_base / 1_000_000,
+              'candidate_default_median_ms': med_normal / 1_000_000,
+              'trusted_fast_path_median_ms': med_trusted / 1_000_000,
+              'algorithm_gain_percent': algorithm_gain * 100,
+              'total_gain_percent': total_gain * 100,
+              'baseline_samples_ms': [value / 1_000_000 for value in baseline],
+              'candidate_default_samples_ms': [value / 1_000_000 for value in normal],
+              'trusted_samples_ms': [value / 1_000_000 for value in trusted],
+          }
+          Path('/tmp/benchmark-results.json').write_text(json.dumps(result, indent=2) + '\n')
+
+          summary = (
+              '## Research-paper parser benchmark v2\n\n'
+              f'- Corpus: {result["documents"]} pinned arXiv PDFs\n'
+              f'- Alternating measured rounds: {result["rounds"]}\n'
+              f'- Unmodified `main`: **{result["baseline_main_median_ms"]:.3f} ms**\n'
+              f'- Candidate with normal detector: **{result["candidate_default_median_ms"]:.3f} ms**\n'
+              f'- Trusted native-text fast path: **{result["trusted_fast_path_median_ms"]:.3f} ms**\n'
+              f'- Core algorithm improvement: **{result["algorithm_gain_percent"]:.2f}%**\n'
+              f'- Improvement over current `main`: **{result["total_gain_percent"]:.2f}%**\n'
+              f'- Output: byte-identical, FNV-1a `{result["markdown_hash_fnv1a64"]}` '
+              f'over {result["markdown_bytes"]:,} bytes\n'
+          )
+          print(summary)
+          Path(os.environ['GITHUB_STEP_SUMMARY']).write_text(summary)
+
+          if algorithm_gain <= 0.005:
+              raise RuntimeError(
+                  f'Fast path did not beat candidate default by 0.5%: {algorithm_gain * 100:.3f}%'
+              )
+          if total_gain <= 0.005:
+              raise RuntimeError(
+                  f'Fast path did not beat current main by 0.5%: {total_gain * 100:.3f}%'
+              )
+          PY
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: research-fast-benchmark-v2
+          path: /tmp/benchmark-results.json
+          if-no-files-found: warn

@@ -73,6 +73,22 @@ class VersionTests(unittest.TestCase):
 
         self.assertEqual(check_versions(self.root), "1.14.0")
 
+    def test_local_wasm_site_uses_manifest_version(self):
+        site = self.root / "site/index.html"
+        local_import = (
+            '<script type="module">\n'
+            'import init from "./wasm/pdf_inspector_wasm.js";\n'
+            '</script>\n'
+        )
+        site.write_text(local_import, encoding="utf-8")
+
+        self.assertEqual(check_versions(self.root), "0.1.0")
+
+        set_versions("1.14.0", self.root)
+
+        self.assertEqual(check_versions(self.root), "1.14.0")
+        self.assertEqual(site.read_text(encoding="utf-8"), local_import)
+
     def test_reports_a_divergent_package(self):
         self._write_manifest("wasm/Cargo.toml", "package", "0.2.0")
 
@@ -99,7 +115,9 @@ class VersionTests(unittest.TestCase):
             "missing module URL\n", encoding="utf-8"
         )
 
-        with self.assertRaisesRegex(ValueError, "Missing pinned WASM package URL"):
+        with self.assertRaisesRegex(
+            ValueError, "Missing pinned WASM package URL or local WASM module"
+        ):
             set_versions("1.14.0", self.root)
 
         self.assertEqual(

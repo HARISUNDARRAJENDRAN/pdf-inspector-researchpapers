@@ -60,6 +60,7 @@ export interface PdfClassification {
 }
 
 export function processPdf(data: Uint8Array, options?: ProcessOptions): PdfProcessResult;
+export function processResearchPdf(data: Uint8Array, options?: ProcessOptions): PdfProcessResult;
 export function detectPdf(data: Uint8Array, options?: Pick<ProcessOptions, "password">): PdfProcessResult;
 export function classifyPdf(data: Uint8Array): PdfClassification;
 export function extractText(data: Uint8Array): string;
@@ -183,7 +184,11 @@ fn deserialize_options(value: JsValue) -> Result<WasmProcessOptions, JsValue> {
     serde_wasm_bindgen::from_value(value).map_err(|error| js_error("invalid options", error))
 }
 
-fn build_options(value: JsValue, mode: ProcessMode) -> Result<PdfOptions, JsValue> {
+fn build_options(
+    value: JsValue,
+    mode: ProcessMode,
+    trusted_research_paper: bool,
+) -> Result<PdfOptions, JsValue> {
     let options = deserialize_options(value)?;
     if options
         .pages
@@ -196,7 +201,11 @@ fn build_options(value: JsValue, mode: ProcessMode) -> Result<PdfOptions, JsValu
         ));
     }
 
-    let mut result = PdfOptions::new().mode(mode);
+    let mut result = if trusted_research_paper {
+        PdfOptions::research_paper().mode(mode)
+    } else {
+        PdfOptions::new().mode(mode)
+    };
     if let Some(pages) = options.pages {
         result = result.pages(pages);
     }
@@ -230,10 +239,25 @@ fn initialize() {
 #[wasm_bindgen(js_name = processPdf, skip_typescript)]
 pub fn process_pdf(data: &[u8], options: JsValue) -> Result<JsValue, JsValue> {
     initialize();
-    let options = build_options(options, ProcessMode::Full)?;
+    let options = build_options(options, ProcessMode::Full, false)?;
     let started = js_sys::Date::now();
     let mut result = pdf_inspector::process_pdf_mem_with_options(data, options)
         .map_err(|error| js_error("process PDF", error))?;
+    result.processing_time_ms = (js_sys::Date::now() - started).max(0.0) as u64;
+    serialize(&WasmPdfProcessResult::from(result))
+}
+
+/// Process caller-verified native-text research paper bytes inside WebAssembly.
+///
+/// This skips the general-purpose pre-extraction classification pass while
+/// retaining the normal extraction, Markdown, layout, and text-quality checks.
+#[wasm_bindgen(js_name = processResearchPdf, skip_typescript)]
+pub fn process_research_pdf(data: &[u8], options: JsValue) -> Result<JsValue, JsValue> {
+    initialize();
+    let options = build_options(options, ProcessMode::Full, true)?;
+    let started = js_sys::Date::now();
+    let mut result = pdf_inspector::process_pdf_mem_with_options(data, options)
+        .map_err(|error| js_error("process research PDF", error))?;
     result.processing_time_ms = (js_sys::Date::now() - started).max(0.0) as u64;
     serialize(&WasmPdfProcessResult::from(result))
 }
@@ -242,7 +266,7 @@ pub fn process_pdf(data: &[u8], options: JsValue) -> Result<JsValue, JsValue> {
 #[wasm_bindgen(js_name = detectPdf, skip_typescript)]
 pub fn detect_pdf(data: &[u8], options: JsValue) -> Result<JsValue, JsValue> {
     initialize();
-    let options = build_options(options, ProcessMode::DetectOnly)?;
+    let options = build_options(options, ProcessMode::DetectOnly, false)?;
     let started = js_sys::Date::now();
     let mut result = pdf_inspector::process_pdf_mem_with_options(data, options)
         .map_err(|error| js_error("detect PDF", error))?;
@@ -391,6 +415,23 @@ mod tests {
 
         assert_eq!(pdf_type, "TextBased");
         assert!(!markdown.is_empty());
+    }
+
+    #[wasm_bindgen_test]
+    fn research_path_matches_standard_markdown() {
+        let standard = process_pdf(TEXT_PDF, JsValue::UNDEFINED).expect("process standard PDF");
+        let research =
+            process_research_pdf(TEXT_PDF, JsValue::UNDEFINED).expect("process research PDF");
+        let standard_markdown = Reflect::get(&standard, &JsValue::from_str("markdown"))
+            .expect("standard markdown")
+            .as_string()
+            .expect("standard markdown string");
+        let research_markdown = Reflect::get(&research, &JsValue::from_str("markdown"))
+            .expect("research markdown")
+            .as_string()
+            .expect("research markdown string");
+
+        assert_eq!(standard_markdown, research_markdown);
     }
 
     #[wasm_bindgen_test]

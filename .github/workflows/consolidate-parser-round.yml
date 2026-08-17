@@ -1,0 +1,126 @@
+name: Consolidate parser fidelity round
+
+on:
+  push:
+    branches: [lab/research-fidelity-audit]
+    paths:
+      - '.github/workflows/consolidate-parser-round.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+env:
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  consolidate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Wait for parser candidate and promotion workflows
+        run: |
+          set -euo pipefail
+          workflows=(
+            apply-cross-page-paragraph.yml
+            promote-caption-fidelity.yml
+            promote-cross-page-paragraph.yml
+            promote-combined-fidelity-fallback.yml
+            promote-exact-overlay-dedup.yml
+            evaluate-upstream-table-fidelity.yml
+          )
+          for attempt in $(seq 1 240); do
+            active=0
+            for workflow in "${workflows[@]}"; do
+              count=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow/runs?per_page=20" --jq '[.workflow_runs[] | select(.status == "queued" or .status == "in_progress")] | length' 2>/dev/null || echo 0)
+              active=$((active + count))
+            done
+            if [[ "$active" -eq 0 ]]; then
+              exit 0
+            fi
+            echo "waiting for $active workflow run(s) ($attempt/240)"
+            sleep 60
+          done
+          exit 1
+
+      - name: Collect workflow conclusions and evidence artifacts
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/parser-round
+          mkdir -p /tmp/parser-round/artifacts
+          workflows=(
+            promote-caption-fidelity.yml
+            promote-cross-page-paragraph.yml
+            promote-combined-fidelity-fallback.yml
+            promote-exact-overlay-dedup.yml
+            evaluate-upstream-table-fidelity.yml
+          )
+          {
+            echo '# Research parser fidelity round'
+            echo
+            git fetch origin main lab/research-fidelity-audit
+            echo "- Main commit: \`$(git rev-parse origin/main)\`"
+            echo "- Research branch: \`$(git rev-parse origin/lab/research-fidelity-audit)\`"
+            echo "- Generated: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo
+            echo '## Production heuristics detected'
+            echo
+            if git show origin/main:src/markdown/classify.rs | grep -q 'caption_suffix'; then echo '- Scientific caption identifier grammar: included'; else echo '- Scientific caption identifier grammar: not promoted'; fi
+            if git show origin/main:src/markdown/preprocess.rs | grep -q 'merge_wrapped_caption_lines'; then echo '- Wrapped caption reconstruction: included'; else echo '- Wrapped caption reconstruction: not promoted'; fi
+            if git show origin/main:src/markdown/convert.rs | grep -q 'paragraph_continues_across_page'; then echo '- Cross-page prose continuity: included'; else echo '- Cross-page prose continuity: not promoted'; fi
+            if git show origin/main:src/markdown/preprocess.rs | grep -q 'deduplicate_exact_overlay_items'; then echo '- Exact duplicate overlay removal: included'; else echo '- Exact duplicate overlay removal: not promoted'; fi
+            echo
+            echo '## Workflow conclusions'
+            echo
+          } > /tmp/parser-round/report.md
+
+          for workflow in "${workflows[@]}"; do
+            row=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow/runs?per_page=10" --jq '.workflow_runs | map(select(.status == "completed")) | first | [.id,.conclusion,.head_sha,.html_url] | @tsv' 2>/dev/null || true)
+            if [[ -z "$row" || "$row" == $'\t\t\t' ]]; then
+              echo "- $workflow: no completed run" >> /tmp/parser-round/report.md
+              continue
+            fi
+            IFS=$'\t' read -r run_id conclusion head_sha run_url <<< "$row"
+            echo "- $workflow: **$conclusion** on \`$head_sha\` — $run_url" >> /tmp/parser-round/report.md
+            mkdir -p "/tmp/parser-round/artifacts/$workflow"
+            gh run download "$run_id" --dir "/tmp/parser-round/artifacts/$workflow" >/dev/null 2>&1 || true
+          done
+
+          {
+            echo
+            echo '## Gate evidence'
+            echo
+            found=0
+            while IFS= read -r file; do
+              found=1
+              echo "### $(basename "$file")"
+              echo
+              echo '```json'
+              cat "$file"
+              echo '```'
+              echo
+            done < <(find /tmp/parser-round/artifacts -type f -name '*.json' | sort)
+            if [[ "$found" -eq 0 ]]; then echo 'No JSON gate artifact was produced by a successful promotion.'; fi
+          } >> /tmp/parser-round/report.md
+
+      - name: Commit consolidated report to research branch
+        run: |
+          set -euo pipefail
+          git fetch origin lab/research-fidelity-audit
+          git reset --hard origin/lab/research-fidelity-audit
+          mkdir -p benchmarks/research_fidelity/reports
+          cp /tmp/parser-round/report.md benchmarks/research_fidelity/reports/latest-parser-round.md
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- benchmarks/research_fidelity/reports/latest-parser-round.md
+          if git diff --cached --quiet; then
+            echo 'report unchanged'
+          else
+            git commit -m 'docs: record latest parser fidelity round'
+            git push origin HEAD:lab/research-fidelity-audit
+          fi

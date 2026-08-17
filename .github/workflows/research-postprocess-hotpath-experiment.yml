@@ -1,0 +1,282 @@
+name: Research Markdown hot-path experiment
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [opt/research-hotpath-cleanup]
+    paths: ['.github/workflows/research-postprocess-hotpath-experiment.yml']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  RAYON_NUM_THREADS: '2'
+  MALLOC_ARENA_MAX: '2'
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: benchmarks/research_fidelity/requirements.txt
+
+      - name: Install audit dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pandoc time
+          python -m pip install --upgrade pip
+          python -m pip install -r benchmarks/research_fidelity/requirements.txt
+
+      - name: Prepare baseline and candidate
+        run: |
+          set -euo pipefail
+          git fetch origin main lab/research-fidelity-audit
+          BASE_SHA=$(git rev-parse origin/main)
+          echo "BASE_SHA=$BASE_SHA" >> "$GITHUB_ENV"
+          git worktree add --detach /tmp/pdf-baseline "$BASE_SHA"
+          git worktree add --detach /tmp/pdf-candidate "$BASE_SHA"
+          git show origin/lab/research-fidelity-audit:benchmarks/research_fidelity/compare_candidate.py > /tmp/compare_candidate.py
+          mkdir -p "$RUNNER_TEMP/hotpath-experiment/report"
+
+      - name: Add allocation-free no-op paths to Markdown cleanup
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('/tmp/pdf-candidate/src/markdown/postprocess.rs')
+          source = path.read_text()
+
+          newline_old = '''    // Remove excessive newlines (more than 2 in a row)\n    while text.contains("\\n\\n\\n") {\n        text = text.replace("\\n\\n\\n", "\\n\\n");\n    }\n'''
+          newline_new = '''    // Remove excessive newlines (more than 2 in a row) in one bounded pass.\n    // The previous replace loop rescanned and reallocated the whole document\n    // for every additional newline in a long run.\n    collapse_excessive_newlines(&mut text);\n'''
+          if source.count(newline_old) != 1:
+              raise SystemExit('newline cleanup anchor changed')
+          source = source.replace(newline_old, newline_new, 1)
+
+          collapse_anchor = '''/// Collapse runs of 2+ spaces to a single space within each line.\n/// Preserves leading indentation and markdown table pipe alignment.\nfn collapse_consecutive_spaces(text: &mut String) {\n'''
+          collapse_new = '''/// Collapse runs of 2+ spaces to a single space within each line.\n/// Preserves leading indentation and markdown table pipe alignment.\nfn collapse_consecutive_spaces(text: &mut String) {\n    // This function intentionally runs twice in the cleanup pipeline. The\n    // second call is usually a no-op; avoid copying the full Markdown buffer.\n    if !text.as_bytes().windows(2).any(|pair| pair == b"  ") {\n        return;\n    }\n'''
+          if source.count(collapse_anchor) != 1:
+              raise SystemExit('space collapse anchor changed')
+          source = source.replace(collapse_anchor, collapse_new, 1)
+
+          closing_anchor = '''fn remove_spaces_before_closing_brackets(text: &mut String) {\n    let mut result = String::with_capacity(text.len());\n'''
+          closing_new = '''fn remove_spaces_before_closing_brackets(text: &mut String) {\n    if !text.contains(" ]") {\n        return;\n    }\n    let mut result = String::with_capacity(text.len());\n'''
+          if source.count(closing_anchor) != 1:
+              raise SystemExit('closing bracket cleanup anchor changed')
+          source = source.replace(closing_anchor, closing_new, 1)
+
+          punct_anchor = '''fn remove_spaces_before_sentence_punctuation(text: &mut String) {\n    let chars: Vec<char> = text.chars().collect();\n'''
+          punct_new = '''fn remove_spaces_before_sentence_punctuation(text: &mut String) {\n    if !text.contains(" .") && !text.contains(" ,") && !text.contains(" ;") {\n        return;\n    }\n    let chars: Vec<char> = text.chars().collect();\n'''
+          if source.count(punct_anchor) != 1:
+              raise SystemExit('punctuation cleanup anchor changed')
+          source = source.replace(punct_anchor, punct_new, 1)
+
+          insertion_anchor = '''/// Collapse runs of 2+ spaces to a single space within each line.\n'''
+          helper = r'''fn collapse_excessive_newlines(text: &mut String) {
+    if !text.contains("\n\n\n") {
+        return;
+    }
+    let mut result = String::with_capacity(text.len());
+    let mut newline_run = 0usize;
+    for character in text.chars() {
+        if character == '\n' {
+            newline_run += 1;
+            if newline_run <= 2 {
+                result.push(character);
+            }
+        } else {
+            newline_run = 0;
+            result.push(character);
+        }
+    }
+    *text = result;
+}
+
+'''
+          if source.count(insertion_anchor) != 1:
+              raise SystemExit('helper insertion anchor changed')
+          source = source.replace(insertion_anchor, helper + insertion_anchor, 1)
+
+          source += r'''
+
+#[cfg(test)]
+mod hot_path_cleanup_tests {
+    use super::*;
+
+    #[test]
+    fn excessive_newline_collapse_matches_legacy_fixed_point() {
+        for original in [
+            "a\n\n\nb",
+            "a\n\n\n\n\n\nb",
+            "\n\n\nstart",
+            "end\n\n\n",
+            "already\n\nclean",
+        ] {
+            let mut expected = original.to_owned();
+            while expected.contains("\n\n\n") {
+                expected = expected.replace("\n\n\n", "\n\n");
+            }
+            let mut candidate = original.to_owned();
+            collapse_excessive_newlines(&mut candidate);
+            assert_eq!(candidate, expected, "input={original:?}");
+        }
+    }
+
+    #[test]
+    fn no_op_guards_preserve_clean_markdown() {
+        let original = "# Title\n\nA clean paragraph with [units] and punctuation.\n";
+        let mut value = original.to_owned();
+        collapse_consecutive_spaces(&mut value);
+        remove_spaces_before_closing_brackets(&mut value);
+        remove_spaces_before_sentence_punctuation(&mut value);
+        assert_eq!(value, original);
+    }
+}
+'''
+          path.write_text(source)
+          PY
+          cd /tmp/pdf-candidate
+          cargo fmt --all
+          git diff --check
+
+      - name: Validate candidate
+        run: |
+          set -euo pipefail
+          cd /tmp/pdf-candidate
+          cargo fmt --all -- --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test --all-targets
+
+      - name: Build paired audit binaries
+        run: |
+          set -euo pipefail
+          CARGO_TARGET_DIR="$RUNNER_TEMP/baseline-target" cargo build --release --manifest-path /tmp/pdf-baseline/Cargo.toml --bin research-audit
+          CARGO_TARGET_DIR="$RUNNER_TEMP/candidate-target" cargo build --release --manifest-path /tmp/pdf-candidate/Cargo.toml --bin research-audit
+          echo "BASELINE_BINARY=$RUNNER_TEMP/baseline-target/release/research-audit" >> "$GITHUB_ENV"
+          echo "CANDIDATE_BINARY=$RUNNER_TEMP/candidate-target/release/research-audit" >> "$GITHUB_ENV"
+
+      - name: Download 100-paper corpus
+        run: |
+          set -euo pipefail
+          python benchmarks/research_fidelity/audit.py select --arxiv 60 --pmc 40 --out "$RUNNER_TEMP/hotpath-experiment/manifest.json"
+          python benchmarks/research_fidelity/audit.py download --manifest "$RUNNER_TEMP/hotpath-experiment/manifest.json" --root "$RUNNER_TEMP/hotpath-experiment/corpus"
+
+      - name: Require byte-identical Markdown on every paper
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os, pathlib, subprocess
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'hotpath-experiment'
+          manifest = json.loads((root / 'manifest.json').read_text())
+          corpus = root / 'corpus'
+          baseline = os.environ['BASELINE_BINARY']
+          candidate = os.environ['CANDIDATE_BINARY']
+          compared = 0
+          mismatches = []
+          for paper in manifest['papers']:
+              if paper.get('download_status') != 'ok':
+                  continue
+              pdf = corpus / paper['pdf_path']
+              def run(binary):
+                  completed = subprocess.run(
+                      [binary, 'research', str(pdf)], check=True,
+                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                  )
+                  return json.loads(completed.stdout)['markdown']
+              left, right = run(baseline), run(candidate)
+              compared += 1
+              if left != right:
+                  mismatches.append(paper['id'])
+          report = {'compared': compared, 'mismatches': mismatches, 'passed': not mismatches}
+          out = root / 'report' / 'markdown-equivalence.json'
+          out.write_text(json.dumps(report, indent=2, sort_keys=True) + '\n')
+          print(json.dumps(report, indent=2))
+          if compared < 80 or mismatches:
+              raise SystemExit('candidate changed Markdown output')
+          PY
+
+      - name: Require measurable paired latency gain
+        run: |
+          set -euo pipefail
+          python benchmarks/research_fidelity/audit.py stress \
+            --manifest "$RUNNER_TEMP/hotpath-experiment/manifest.json" \
+            --root "$RUNNER_TEMP/hotpath-experiment/corpus" \
+            --fork-binary "$CANDIDATE_BINARY" \
+            --out-dir "$RUNNER_TEMP/hotpath-experiment/report" --pages 200 --repeats 1
+          python /tmp/compare_candidate.py latency \
+            --baseline-binary "$BASELINE_BINARY" --candidate-binary "$CANDIDATE_BINARY" \
+            --pdf "$RUNNER_TEMP/hotpath-experiment/report/research-stress-200p.pdf" \
+            --warmups 3 --rounds 20 --max-ratio 0.995 \
+            --out "$RUNNER_TEMP/hotpath-experiment/report/latency.json"
+          rm -f "$RUNNER_TEMP/hotpath-experiment/report/research-stress-200p.pdf"
+
+      - name: Validate WebAssembly
+        run: |
+          set -euo pipefail
+          cd /tmp/pdf-candidate
+          cargo check --target wasm32-unknown-unknown
+          cargo check --manifest-path wasm/Cargo.toml --target wasm32-unknown-unknown
+          cargo clippy --manifest-path wasm/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
+
+      - name: Build validation evidence
+        if: success()
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os, pathlib
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'hotpath-experiment' / 'report'
+          record = {
+              'change': 'allocation-free Markdown cleanup no-op paths',
+              'baseline_sha': os.environ['BASE_SHA'],
+              'candidate_branch_sha': os.environ['GITHUB_SHA'],
+              'equivalence': json.loads((root / 'markdown-equivalence.json').read_text()),
+              'latency': json.loads((root / 'latency.json').read_text()),
+          }
+          (root / 'validated.json').write_text(json.dumps(record, indent=2, sort_keys=True) + '\n')
+          PY
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: markdown-hotpath-experiment-${{ github.run_id }}
+          path: ${{ runner.temp }}/hotpath-experiment/report
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Publish validated speedup and evidence to main
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$BASE_SHA"
+          git worktree add --detach /tmp/pdf-release origin/main
+          cp /tmp/pdf-candidate/src/markdown/postprocess.rs /tmp/pdf-release/src/markdown/postprocess.rs
+          mkdir -p /tmp/pdf-release/benchmarks/research_fidelity/validated
+          cp "$RUNNER_TEMP/hotpath-experiment/report/validated.json" \
+             /tmp/pdf-release/benchmarks/research_fidelity/validated/markdown-hotpath-latency.json
+          cd /tmp/pdf-release
+          cargo fmt --all
+          git diff --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- src/markdown/postprocess.rs benchmarks/research_fidelity/validated/markdown-hotpath-latency.json
+          git commit -m 'perf: avoid no-op Markdown cleanup allocations'
+          git push origin HEAD:refs/heads/main

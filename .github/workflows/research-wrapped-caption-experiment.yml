@@ -1,0 +1,373 @@
+name: Wrapped research caption experiment
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [opt/research-wrapped-captions]
+    paths: ['.github/workflows/research-wrapped-caption-experiment.yml']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  RAYON_NUM_THREADS: '2'
+  MALLOC_ARENA_MAX: '2'
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: benchmarks/research_fidelity/requirements.txt
+
+      - name: Install audit dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pandoc time
+          python -m pip install --upgrade pip
+          python -m pip install -r benchmarks/research_fidelity/requirements.txt
+
+      - name: Prepare baseline and candidate
+        run: |
+          set -euo pipefail
+          git fetch origin main lab/research-fidelity-audit
+          BASE_SHA=$(git rev-parse origin/main)
+          echo "BASE_SHA=$BASE_SHA" >> "$GITHUB_ENV"
+          git worktree add --detach /tmp/pdf-baseline "$BASE_SHA"
+          git worktree add --detach /tmp/pdf-candidate "$BASE_SHA"
+          git show origin/lab/research-fidelity-audit:benchmarks/research_fidelity/compare_candidate.py > /tmp/compare_candidate.py
+          mkdir -p "$RUNNER_TEMP/wrapped-caption/report"
+
+      - name: Add conservative wrapped-caption merging
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          preprocess = Path('/tmp/pdf-candidate/src/markdown/preprocess.rs')
+          source = preprocess.read_text()
+          analysis_old = 'use super::analysis::detect_header_level;\n'
+          analysis_new = '''use super::analysis::{detect_header_level, is_heading_fragment};\nuse super::classify::{is_caption_line, is_list_item, starts_with_bullet_marker};\n'''
+          if source.count(analysis_old) != 1:
+              raise SystemExit('preprocess analysis import anchor changed')
+          source = source.replace(analysis_old, analysis_new, 1)
+
+          anchor = '/// Resolve a heading level for a line, considering both struct-tree roles and font heuristics.\n'
+          implementation = r'''fn caption_line_geometry(line: &TextLine) -> Option<(f32, f32, &str)> {
+    let first = line.items.first()?;
+    Some((first.x, first.font_size, first.font.as_str()))
+}
+
+fn caption_continuation_candidate(
+    current: &TextLine,
+    next: &TextLine,
+    start_x: f32,
+    start_size: f32,
+    start_font: &str,
+    base_size: f32,
+) -> bool {
+    if current.page != next.page || next.items.is_empty() {
+        return false;
+    }
+    let y_gap = current.y - next.y;
+    if y_gap <= 0.0 || y_gap > start_size.max(base_size * 0.75) * 1.75 {
+        return false;
+    }
+
+    let next_text = next.text();
+    let next_trimmed = next_text.trim();
+    if next_trimmed.is_empty()
+        || is_caption_line(next_trimmed)
+        || is_list_item(next_trimmed)
+        || starts_with_bullet_marker(next_trimmed)
+        || is_heading_fragment(next_trimmed)
+    {
+        return false;
+    }
+
+    let current_text = current.text();
+    let current_trimmed = current_text.trim_end();
+    if current_trimmed.ends_with(['.', '!', '?'])
+        && next_trimmed
+            .chars()
+            .find(|character| character.is_alphabetic())
+            .is_some_and(char::is_uppercase)
+    {
+        return false;
+    }
+
+    let Some(next_first) = next.items.first() else {
+        return false;
+    };
+    let x_delta = next_first.x - start_x;
+    let compatible_indent = (-4.0..=base_size.max(10.0) * 8.0).contains(&x_delta);
+    let compatible_size = (next_first.font_size - start_size).abs() <= 0.7;
+    let compatible_font = next_first.font == start_font;
+    compatible_indent && compatible_size && compatible_font
+}
+
+/// Merge visual wrap lines belonging to one scientific figure/table caption.
+///
+/// Caption prefixes are semantic, but PDF text is line-oriented. Emitting a
+/// blank Markdown block after only the first visual line lowers caption recall
+/// and creates false paragraph boundaries. This pass follows at most four
+/// tightly aligned, same-font lines and stops at new structure or a completed
+/// sentence. Ordinary lines pay one prefix check and no auxiliary allocation.
+pub(crate) fn merge_wrapped_caption_lines(
+    lines: Vec<TextLine>,
+    base_size: f32,
+) -> Vec<TextLine> {
+    let mut output = Vec::with_capacity(lines.len());
+    let mut index = 0usize;
+    while index < lines.len() {
+        let text = lines[index].text();
+        if !is_caption_line(text.trim()) {
+            output.push(lines[index].clone());
+            index += 1;
+            continue;
+        }
+
+        let Some((start_x, start_size, start_font)) = caption_line_geometry(&lines[index]) else {
+            output.push(lines[index].clone());
+            index += 1;
+            continue;
+        };
+        let start_font = start_font.to_owned();
+        let mut merged = lines[index].clone();
+        let mut next_index = index + 1;
+        let mut continuation_count = 0usize;
+        while next_index < lines.len()
+            && continuation_count < 4
+            && caption_continuation_candidate(
+                &merged,
+                &lines[next_index],
+                start_x,
+                start_size,
+                &start_font,
+                base_size,
+            )
+        {
+            if let Some(first) = lines[next_index].items.first() {
+                let mut first = first.clone();
+                first.text = format!(" {}", first.text.trim_start());
+                merged.items.push(first);
+            }
+            merged
+                .items
+                .extend(lines[next_index].items.iter().skip(1).cloned());
+            next_index += 1;
+            continuation_count += 1;
+        }
+        output.push(merged);
+        index = next_index;
+    }
+    output
+}
+
+'''
+          if source.count(anchor) != 1:
+              raise SystemExit('preprocess function anchor changed')
+          source = source.replace(anchor, implementation + anchor, 1)
+          source += r'''
+
+#[cfg(test)]
+mod wrapped_caption_tests {
+    use super::*;
+    use crate::types::{ItemType, TextItem};
+
+    fn line(text: &str, y: f32, x: f32, font: &str, size: f32) -> TextLine {
+        TextLine {
+            items: vec![TextItem {
+                text: text.to_owned(),
+                x,
+                y,
+                width: text.chars().count() as f32 * size * 0.45,
+                height: size,
+                font: font.to_owned(),
+                font_size: size,
+                page: 1,
+                is_bold: false,
+                is_italic: false,
+                is_underline: false,
+                is_strikeout: false,
+                item_type: ItemType::Text,
+                mcid: None,
+            }],
+            y,
+            page: 1,
+            adaptive_threshold: 0.1,
+        }
+    }
+
+    #[test]
+    fn merges_tightly_aligned_caption_wraps() {
+        let lines = vec![
+            line("Figure 2. Architecture of the proposed edge", 700.0, 72.0, "Caption", 9.0),
+            line("intelligence framework and its prediction loop", 687.0, 88.0, "Caption", 9.0),
+            line("under changing wireless channel conditions.", 674.0, 88.0, "Caption", 9.0),
+            line("The body discussion starts here.", 640.0, 72.0, "Body", 10.0),
+        ];
+        let merged = merge_wrapped_caption_lines(lines, 10.0);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(
+            merged[0].text(),
+            "Figure 2. Architecture of the proposed edge intelligence framework and its prediction loop under changing wireless channel conditions."
+        );
+    }
+
+    #[test]
+    fn stops_at_new_caption_or_body_sentence() {
+        let lines = vec![
+            line("Table 1. Accuracy results.", 700.0, 72.0, "Caption", 9.0),
+            line("The model remains stable in every trial.", 687.0, 72.0, "Caption", 9.0),
+            line("Figure 3. Latency results", 650.0, 72.0, "Caption", 9.0),
+        ];
+        let merged = merge_wrapped_caption_lines(lines, 10.0);
+        assert_eq!(merged.len(), 3);
+    }
+}
+'''
+          preprocess.write_text(source)
+
+          convert = Path('/tmp/pdf-candidate/src/markdown/convert.rs')
+          source = convert.read_text()
+          anchor = '    let lines = merge_drop_caps(lines, base_size);\n'
+          replacement = '''    let lines = merge_drop_caps(lines, base_size);\n    let lines = super::preprocess::merge_wrapped_caption_lines(lines, base_size);\n'''
+          if source.count(anchor) != 2:
+              raise SystemExit(f'expected two drop-cap anchors, found {source.count(anchor)}')
+          source = source.replace(anchor, replacement)
+          convert.write_text(source)
+          PY
+          cd /tmp/pdf-candidate
+          cargo fmt --all
+          git diff --check
+
+      - name: Validate candidate
+        run: |
+          set -euo pipefail
+          cd /tmp/pdf-candidate
+          cargo fmt --all -- --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test --all-targets
+
+      - name: Build paired binaries and upstream
+        run: |
+          set -euo pipefail
+          CARGO_TARGET_DIR="$RUNNER_TEMP/baseline-target" cargo build --release --manifest-path /tmp/pdf-baseline/Cargo.toml --bin research-audit
+          CARGO_TARGET_DIR="$RUNNER_TEMP/candidate-target" cargo build --release --manifest-path /tmp/pdf-candidate/Cargo.toml --bin research-audit
+          git clone --depth 1 https://github.com/firecrawl/pdf-inspector.git "$RUNNER_TEMP/upstream"
+          CARGO_TARGET_DIR="$RUNNER_TEMP/upstream-target" cargo build --release --manifest-path "$RUNNER_TEMP/upstream/Cargo.toml" --bin pdf2md
+          echo "BASELINE_BINARY=$RUNNER_TEMP/baseline-target/release/research-audit" >> "$GITHUB_ENV"
+          echo "CANDIDATE_BINARY=$RUNNER_TEMP/candidate-target/release/research-audit" >> "$GITHUB_ENV"
+          echo "UPSTREAM_BINARY=$RUNNER_TEMP/upstream-target/release/pdf2md" >> "$GITHUB_ENV"
+
+      - name: Download one 100-paper corpus
+        run: |
+          set -euo pipefail
+          python benchmarks/research_fidelity/audit.py select --arxiv 60 --pmc 40 --out "$RUNNER_TEMP/wrapped-caption/manifest.json"
+          python benchmarks/research_fidelity/audit.py download --manifest "$RUNNER_TEMP/wrapped-caption/manifest.json" --root "$RUNNER_TEMP/wrapped-caption/corpus"
+
+      - name: Compare source-grounded fidelity
+        run: |
+          set -euo pipefail
+          python benchmarks/research_fidelity/audit.py evaluate \
+            --manifest "$RUNNER_TEMP/wrapped-caption/manifest.json" \
+            --root "$RUNNER_TEMP/wrapped-caption/corpus" \
+            --fork-binary "$BASELINE_BINARY" --upstream-binary "$UPSTREAM_BINARY" \
+            --out "$RUNNER_TEMP/wrapped-caption/baseline.jsonl"
+          python benchmarks/research_fidelity/audit.py evaluate \
+            --manifest "$RUNNER_TEMP/wrapped-caption/manifest.json" \
+            --root "$RUNNER_TEMP/wrapped-caption/corpus" \
+            --fork-binary "$CANDIDATE_BINARY" --upstream-binary "$UPSTREAM_BINARY" \
+            --out "$RUNNER_TEMP/wrapped-caption/candidate.jsonl"
+          python /tmp/compare_candidate.py quality \
+            --baseline "$RUNNER_TEMP/wrapped-caption/baseline.jsonl" \
+            --candidate "$RUNNER_TEMP/wrapped-caption/candidate.jsonl" \
+            --out "$RUNNER_TEMP/wrapped-caption/report/quality.json"
+
+      - name: Compare paired 200-page latency
+        run: |
+          set -euo pipefail
+          python benchmarks/research_fidelity/audit.py stress \
+            --manifest "$RUNNER_TEMP/wrapped-caption/manifest.json" \
+            --root "$RUNNER_TEMP/wrapped-caption/corpus" \
+            --fork-binary "$CANDIDATE_BINARY" \
+            --out-dir "$RUNNER_TEMP/wrapped-caption/report" --pages 200 --repeats 1
+          python /tmp/compare_candidate.py latency \
+            --baseline-binary "$BASELINE_BINARY" --candidate-binary "$CANDIDATE_BINARY" \
+            --pdf "$RUNNER_TEMP/wrapped-caption/report/research-stress-200p.pdf" \
+            --warmups 2 --rounds 12 --max-ratio 1.01 \
+            --out "$RUNNER_TEMP/wrapped-caption/report/latency.json"
+          rm -f "$RUNNER_TEMP/wrapped-caption/report/research-stress-200p.pdf"
+
+      - name: Validate WebAssembly
+        run: |
+          set -euo pipefail
+          cd /tmp/pdf-candidate
+          cargo check --target wasm32-unknown-unknown
+          cargo check --manifest-path wasm/Cargo.toml --target wasm32-unknown-unknown
+          cargo clippy --manifest-path wasm/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
+
+      - name: Build versioned validation record
+        if: success()
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os, pathlib
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'wrapped-caption' / 'report'
+          record = {
+              'change': 'wrapped scientific caption recovery',
+              'baseline_sha': os.environ['BASE_SHA'],
+              'candidate_branch_sha': os.environ['GITHUB_SHA'],
+              'quality': json.loads((root / 'quality.json').read_text()),
+              'latency': json.loads((root / 'latency.json').read_text()),
+          }
+          (root / 'validated.json').write_text(json.dumps(record, indent=2, sort_keys=True) + '\n')
+          PY
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wrapped-caption-experiment-${{ github.run_id }}
+          path: ${{ runner.temp }}/wrapped-caption/report
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Publish validated parser and evidence to main
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$BASE_SHA"
+          git worktree add --detach /tmp/pdf-release origin/main
+          cp /tmp/pdf-candidate/src/markdown/preprocess.rs /tmp/pdf-release/src/markdown/preprocess.rs
+          cp /tmp/pdf-candidate/src/markdown/convert.rs /tmp/pdf-release/src/markdown/convert.rs
+          mkdir -p /tmp/pdf-release/benchmarks/research_fidelity/validated
+          cp "$RUNNER_TEMP/wrapped-caption/report/validated.json" \
+             /tmp/pdf-release/benchmarks/research_fidelity/validated/wrapped-caption-fidelity.json
+          cd /tmp/pdf-release
+          cargo fmt --all
+          git diff --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- src/markdown/preprocess.rs src/markdown/convert.rs benchmarks/research_fidelity/validated/wrapped-caption-fidelity.json
+          git commit -m 'fix: preserve wrapped scientific captions'
+          git push origin HEAD:refs/heads/main

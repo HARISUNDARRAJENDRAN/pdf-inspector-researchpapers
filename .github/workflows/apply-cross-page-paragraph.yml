@@ -1,0 +1,420 @@
+name: Apply cross-page paragraph continuity candidate
+
+on:
+  push:
+    branches: [lab/research-fidelity-audit]
+    paths:
+      - '.github/workflows/apply-cross-page-paragraph.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Apply conservative cross-page prose continuation heuristic
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/markdown/convert.rs')
+          source = path.read_text()
+
+          helper_anchor = '''/// Pre-scan struct heading tags to find levels that are overused — i.e., tagged on
+'''
+          helper = r'''/// Whether two adjacent page-edge lines are one logical prose paragraph.
+///
+/// Page boundaries are a rendering concern, not a semantic paragraph marker.
+/// Research papers often carry a justified sentence from the bottom of one
+/// page to a lowercase continuation at the top of the next. The old converter
+/// always emitted a blank line there, over-segmenting long papers.
+///
+/// This deliberately requires several independent signals: consecutive pages,
+/// body-sized matching type, prose-sized lines, an unfinished previous line,
+/// and a lowercase continuation. Captions, lists, headings, dot leaders, and
+/// emphasized display text are excluded. The check is O(1) and runs only once
+/// per page transition.
+fn paragraph_continues_across_page(
+    previous: &TextLine,
+    next: &TextLine,
+    base_size: f32,
+) -> bool {
+    if next.page != previous.page.saturating_add(1) {
+        return false;
+    }
+
+    let previous_text = previous.text();
+    let next_text = next.text();
+    let previous_trimmed = previous_text.trim();
+    let next_trimmed = next_text.trim();
+    if previous_trimmed.is_empty() || next_trimmed.is_empty() {
+        return false;
+    }
+
+    if previous_trimmed.split_whitespace().count() < 6
+        || next_trimmed.split_whitespace().count() < 3
+        || is_caption_line(previous_trimmed)
+        || is_caption_line(next_trimmed)
+        || is_list_item(previous_trimmed)
+        || is_list_item(next_trimmed)
+        || starts_with_bullet_marker(previous_trimmed)
+        || starts_with_bullet_marker(next_trimmed)
+        || is_heading_fragment(previous_trimmed)
+        || is_heading_fragment(next_trimmed)
+        || has_dot_leaders(previous_trimmed)
+        || has_dot_leaders(next_trimmed)
+        || crate::markdown::analysis::line_is_mostly_bold(previous)
+        || crate::markdown::analysis::line_is_mostly_bold(next)
+    {
+        return false;
+    }
+
+    let (Some(previous_item), Some(next_item)) =
+        (previous.items.first(), next.items.first())
+    else {
+        return false;
+    };
+    if previous_item.font_size < base_size * 0.78
+        || previous_item.font_size > base_size * 1.25
+        || next_item.font_size < base_size * 0.78
+        || next_item.font_size > base_size * 1.25
+        || (previous_item.font_size - next_item.font_size).abs()
+            > previous_item.font_size.max(next_item.font_size) * 0.08
+        || previous_item.is_bold != next_item.is_bold
+        || previous_item.is_italic != next_item.is_italic
+    {
+        return false;
+    }
+
+    fn family(font: &str) -> &str {
+        font.split_once('+')
+            .filter(|(prefix, _)| {
+                prefix.len() == 6 && prefix.chars().all(|character| character.is_ascii_uppercase())
+            })
+            .map_or(font, |(_, family)| family)
+    }
+    if !family(&previous_item.font).eq_ignore_ascii_case(family(&next_item.font)) {
+        return false;
+    }
+
+    let previous_terminal = previous_trimmed
+        .chars()
+        .rev()
+        .find(|character| !matches!(character, '"' | '\'' | '’' | '”' | ')' | ']' | '}'));
+    if previous_terminal.is_none_or(|character| matches!(character, '.' | '!' | '?' | ':' | ';')) {
+        return false;
+    }
+
+    next_trimmed
+        .chars()
+        .find(|character| character.is_alphabetic())
+        .is_some_and(char::is_lowercase)
+}
+
+'''
+          if helper_anchor not in source:
+              raise SystemExit('helper insertion anchor not found')
+          source = source.replace(helper_anchor, helper + helper_anchor, 1)
+
+          page_marker = '''        // Page break
+        if line.page != current_page {
+'''
+          first_start = source.find(page_marker)
+          if first_start < 0:
+              raise SystemExit('full converter page block not found')
+          first_end_marker = '''        // Insert tables and images through one ordered stream.'''
+          first_end = source.find(first_end_marker, first_start)
+          if first_end < 0:
+              raise SystemExit('full converter page block end not found')
+
+          full_block = r'''        // Page break. Keep an unfinished prose paragraph open across a
+        // physical page boundary when the typography and text both agree.
+        if line.page != current_page {
+            let wants_page_continuation = current_page > 0
+                && in_paragraph
+                && !options.include_page_numbers
+                && line_idx > 0
+                && paragraph_continues_across_page(&lines[line_idx - 1], line, base_size);
+
+            // Flush current page's remaining tables and images
+            if current_page > 0 {
+                if in_code_block {
+                    output.push_str("```\n");
+                    in_code_block = false;
+                }
+                flush_page_tables_and_images(
+                    current_page,
+                    &page_blocks,
+                    &mut inserted_tables,
+                    &mut inserted_images,
+                    &mut output,
+                    &mut in_paragraph,
+                );
+                if in_paragraph && !wants_page_continuation {
+                    output.push_str("\n\n");
+                    in_paragraph = false;
+                }
+                if !wants_page_continuation || !in_paragraph {
+                    output.push_str("\n\n");
+                }
+            }
+
+            // Flush any intermediate pages (image-only or table-only) between
+            // current_page and line.page that have no text lines. A paragraph
+            // can never continue through an intervening content-only page.
+            for &p in &all_content_pages {
+                if p <= current_page {
+                    continue;
+                }
+                if p >= line.page {
+                    break;
+                }
+                flush_page_tables_and_images(
+                    p,
+                    &page_blocks,
+                    &mut inserted_tables,
+                    &mut inserted_images,
+                    &mut output,
+                    &mut in_paragraph,
+                );
+                if in_paragraph {
+                    output.push_str("\n\n");
+                    in_paragraph = false;
+                }
+                output.push_str("\n\n");
+            }
+
+            let keeps_page_paragraph = wants_page_continuation && in_paragraph;
+            current_page = line.page;
+            // Avoid the normal "backward column jump" paragraph break below
+            // when this first line continues the preceding page.
+            prev_y = if keeps_page_paragraph {
+                line.y + base_size
+            } else {
+                f32::MAX
+            };
+            prev_x = if keeps_page_paragraph {
+                line.items.first().map(|item| item.x).unwrap_or(0.0)
+            } else {
+                0.0
+            };
+            prev_had_dot_leaders = false;
+            paragraph_in_wrapped_bold_run = false;
+
+            if options.include_page_numbers {
+                output.push_str(&format!("<!-- Page {} -->\n\n", current_page));
+            }
+        }
+
+'''
+          source = source[:first_start] + full_block + source[first_end:]
+
+          second_start = source.find(page_marker, first_start + len(full_block))
+          if second_start < 0:
+              raise SystemExit('line-only converter page block not found')
+          second_end_marker = '''        // Paragraph break: large forward Y gap (normal) or large backward jump'''
+          second_end = source.find(second_end_marker, second_start)
+          if second_end < 0:
+              raise SystemExit('line-only converter page block end not found')
+
+          line_only_block = r'''        // Page break. Preserve an unfinished body paragraph across
+        // consecutive pages when the first line is a matching lowercase
+        // continuation; page-number comments intentionally disable this.
+        if line.page != current_page {
+            let keeps_page_paragraph = current_page > 0
+                && in_paragraph
+                && !options.include_page_numbers
+                && line_idx > 0
+                && paragraph_continues_across_page(&lines[line_idx - 1], line, base_size);
+            if current_page > 0 && !keeps_page_paragraph {
+                if in_paragraph {
+                    output.push_str("\n\n");
+                    in_paragraph = false;
+                }
+                output.push_str("\n\n");
+            }
+            current_page = line.page;
+            prev_y = if keeps_page_paragraph {
+                line.y + base_size
+            } else {
+                f32::MAX
+            };
+            in_list = false;
+            last_list_x = None;
+            prev_had_dot_leaders = false;
+            paragraph_in_wrapped_bold_run = false;
+
+            if options.include_page_numbers {
+                output.push_str(&format!("<!-- Page {} -->\n\n", current_page));
+            }
+        }
+
+'''
+          source = source[:second_start] + line_only_block + source[second_end:]
+
+          tests = r'''
+
+#[cfg(test)]
+mod cross_page_paragraph_tests {
+    use super::*;
+    use crate::types::{ItemType, TextItem};
+
+    fn line(text: &str, page: u32, y: f32, font: &str, size: f32, bold: bool) -> TextLine {
+        TextLine {
+            items: vec![TextItem {
+                text: text.into(),
+                x: 72.0,
+                y,
+                width: text.len() as f32 * size * 0.45,
+                height: size,
+                font: font.into(),
+                font_size: size,
+                page,
+                is_bold: bold,
+                is_italic: false,
+                is_underline: false,
+                is_strikeout: false,
+                item_type: ItemType::Text,
+                mcid: None,
+            }],
+            y,
+            page,
+            adaptive_threshold: 0.1,
+        }
+    }
+
+    #[test]
+    fn joins_unfinished_prose_across_a_page_boundary() {
+        let markdown = to_markdown_from_lines(
+            vec![
+                line(
+                    "The proposed method continues across the page without a",
+                    1,
+                    72.0,
+                    "Body",
+                    12.0,
+                    false,
+                ),
+                line(
+                    "visible interruption in the source document.",
+                    2,
+                    720.0,
+                    "Body",
+                    12.0,
+                    false,
+                ),
+            ],
+            MarkdownOptions::default(),
+        );
+        assert!(markdown.contains("without a visible interruption"), "{markdown}");
+    }
+
+    #[test]
+    fn keeps_complete_sentences_separate_across_pages() {
+        let markdown = to_markdown_from_lines(
+            vec![
+                line(
+                    "The preceding paragraph reaches a complete conclusion.",
+                    1,
+                    72.0,
+                    "Body",
+                    12.0,
+                    false,
+                ),
+                line(
+                    "the next paragraph begins on the following page.",
+                    2,
+                    720.0,
+                    "Body",
+                    12.0,
+                    false,
+                ),
+            ],
+            MarkdownOptions::default(),
+        );
+        assert!(markdown.contains("conclusion.\n\nthe next"), "{markdown}");
+    }
+
+    #[test]
+    fn does_not_join_a_new_heading_or_style() {
+        let markdown = to_markdown_from_lines(
+            vec![
+                line(
+                    "The preceding discussion leaves one final unresolved",
+                    1,
+                    72.0,
+                    "Body",
+                    12.0,
+                    false,
+                ),
+                line("Methods", 2, 720.0, "Heading", 14.0, true),
+            ],
+            MarkdownOptions::default(),
+        );
+        assert!(!markdown.contains("unresolved Methods"), "{markdown}");
+    }
+
+    #[test]
+    fn page_number_comments_disable_cross_page_joining() {
+        let options = MarkdownOptions {
+            include_page_numbers: true,
+            ..MarkdownOptions::default()
+        };
+        let markdown = to_markdown_from_lines(
+            vec![
+                line(
+                    "The proposed method continues across the page without a",
+                    1,
+                    72.0,
+                    "Body",
+                    12.0,
+                    false,
+                ),
+                line(
+                    "visible interruption in the source document.",
+                    2,
+                    720.0,
+                    "Body",
+                    12.0,
+                    false,
+                ),
+            ],
+            options,
+        );
+        assert!(markdown.contains("<!-- Page 2 -->"));
+        assert!(!markdown.contains("without a visible interruption"), "{markdown}");
+    }
+}
+'''
+          source += tests
+          path.write_text(source)
+          PY
+
+      - name: Format and validate candidate
+        run: |
+          set -euo pipefail
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo clippy -- -D warnings
+          cargo test
+
+      - name: Commit validated source candidate
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- src/markdown/convert.rs
+          git commit -m 'fix: preserve prose across physical page boundaries'
+          git push origin HEAD:lab/research-fidelity-audit

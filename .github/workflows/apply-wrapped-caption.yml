@@ -1,0 +1,48 @@
+name: Apply wrapped-caption parser candidate
+
+on:
+  push:
+    branches: [lab/research-fidelity-audit]
+    paths:
+      - '.github/workflows/apply-wrapped-caption.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      - name: Apply candidate
+        run: python3 scripts/apply_wrapped_caption_experiment.py .
+
+      - name: Format and validate candidate
+        run: |
+          set -euo pipefail
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo clippy -- -D warnings
+          cargo test
+          cargo check --target wasm32-unknown-unknown
+          cargo check --manifest-path wasm/Cargo.toml --target wasm32-unknown-unknown
+          git diff --check
+
+      - name: Commit validated source candidate
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- src/markdown/preprocess.rs src/markdown/convert.rs
+          git commit -m 'fix: preserve wrapped scientific captions'
+          git push origin HEAD:lab/research-fidelity-audit

@@ -1,0 +1,220 @@
+name: Research parser candidate gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      arxiv_count:
+        description: Number of arXiv papers
+        required: false
+        default: '60'
+      pmc_count:
+        description: Number of PubMed Central papers
+        required: false
+        default: '40'
+      stress_pages:
+        description: Pages in paired latency stress paper
+        required: false
+        default: '200'
+  push:
+    branches: [lab/research-fidelity-audit]
+    paths:
+      - 'src/**/*.rs'
+      - 'benchmarks/research_fidelity/compare_candidate.py'
+      - '.github/workflows/research-candidate-gate.yml'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  RAYON_NUM_THREADS: '2'
+  MALLOC_ARENA_MAX: '2'
+  ARXIV_COUNT: ${{ inputs.arxiv_count || '60' }}
+  PMC_COUNT: ${{ inputs.pmc_count || '40' }}
+  STRESS_PAGES: ${{ inputs.stress_pages || '200' }}
+
+concurrency:
+  group: research-parser-candidate-gate
+  cancel-in-progress: true
+
+jobs:
+  validate-and-promote:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Check out candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: benchmarks/research_fidelity/requirements.txt
+
+      - name: Install source-grounded audit dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pandoc time
+          python -m pip install --upgrade pip
+          python -m pip install -r benchmarks/research_fidelity/requirements.txt
+
+      - name: Prepare current-main baseline
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          BASE_SHA=$(git rev-parse origin/main)
+          echo "BASE_SHA=$BASE_SHA" >> "$GITHUB_ENV"
+          git worktree add --detach /tmp/pdf-baseline "$BASE_SHA"
+          mkdir -p "$RUNNER_TEMP/research-gate/report"
+
+      - name: Validate candidate source
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test --all-targets
+          python -m py_compile benchmarks/research_fidelity/audit.py benchmarks/research_fidelity/audit_part_*.py benchmarks/research_fidelity/compare_candidate.py
+          python -m unittest benchmarks/research_fidelity/test_audit.py
+
+      - name: Build candidate and baseline audit binaries
+        run: |
+          set -euo pipefail
+          CARGO_TARGET_DIR="$RUNNER_TEMP/candidate-target" cargo build --release --bin research-audit
+          CARGO_TARGET_DIR="$RUNNER_TEMP/baseline-target" cargo build --release --manifest-path /tmp/pdf-baseline/Cargo.toml --bin research-audit
+          echo "CANDIDATE_BINARY=$RUNNER_TEMP/candidate-target/release/research-audit" >> "$GITHUB_ENV"
+          echo "BASELINE_BINARY=$RUNNER_TEMP/baseline-target/release/research-audit" >> "$GITHUB_ENV"
+
+      - name: Build current Firecrawl upstream on the same runner
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/firecrawl/pdf-inspector.git "$RUNNER_TEMP/upstream"
+          CARGO_TARGET_DIR="$RUNNER_TEMP/upstream-target" cargo build --release --manifest-path "$RUNNER_TEMP/upstream/Cargo.toml" --bin pdf2md
+          echo "UPSTREAM_BINARY=$RUNNER_TEMP/upstream-target/release/pdf2md" >> "$GITHUB_ENV"
+          git -C "$RUNNER_TEMP/upstream" rev-parse HEAD > "$RUNNER_TEMP/research-gate/report/upstream-sha.txt"
+
+      - name: Select one deterministic diverse corpus
+        run: |
+          set -euo pipefail
+          python benchmarks/research_fidelity/audit.py select \
+            --arxiv "$ARXIV_COUNT" \
+            --pmc "$PMC_COUNT" \
+            --out "$RUNNER_TEMP/research-gate/manifest.json"
+          python benchmarks/research_fidelity/audit.py download \
+            --manifest "$RUNNER_TEMP/research-gate/manifest.json" \
+            --root "$RUNNER_TEMP/research-gate/corpus"
+
+      - name: Evaluate candidate on source ground truth
+        run: |
+          set -euo pipefail
+          python benchmarks/research_fidelity/audit.py evaluate \
+            --manifest "$RUNNER_TEMP/research-gate/manifest.json" \
+            --root "$RUNNER_TEMP/research-gate/corpus" \
+            --fork-binary "$CANDIDATE_BINARY" \
+            --upstream-binary "$UPSTREAM_BINARY" \
+            --out "$RUNNER_TEMP/research-gate/candidate-results.jsonl"
+
+      - name: Evaluate current main on the identical corpus
+        run: |
+          set -euo pipefail
+          python benchmarks/research_fidelity/audit.py evaluate \
+            --manifest "$RUNNER_TEMP/research-gate/manifest.json" \
+            --root "$RUNNER_TEMP/research-gate/corpus" \
+            --fork-binary "$BASELINE_BINARY" \
+            --upstream-binary "$UPSTREAM_BINARY" \
+            --out "$RUNNER_TEMP/research-gate/baseline-results.jsonl"
+
+      - name: Reject fidelity trade-offs
+        run: |
+          set -euo pipefail
+          python benchmarks/research_fidelity/compare_candidate.py quality \
+            --baseline "$RUNNER_TEMP/research-gate/baseline-results.jsonl" \
+            --candidate "$RUNNER_TEMP/research-gate/candidate-results.jsonl" \
+            --out "$RUNNER_TEMP/research-gate/report/quality-comparison.json"
+
+      - name: Generate real 200-page mixed-template stress paper
+        run: |
+          set -euo pipefail
+          python benchmarks/research_fidelity/audit.py stress \
+            --manifest "$RUNNER_TEMP/research-gate/manifest.json" \
+            --root "$RUNNER_TEMP/research-gate/corpus" \
+            --fork-binary "$CANDIDATE_BINARY" \
+            --out-dir "$RUNNER_TEMP/research-gate/report" \
+            --pages "$STRESS_PAGES" \
+            --repeats 1
+          test -s "$RUNNER_TEMP/research-gate/report/research-stress-${STRESS_PAGES}p.pdf"
+
+      - name: Reject latency regressions
+        run: |
+          set -euo pipefail
+          python benchmarks/research_fidelity/compare_candidate.py latency \
+            --baseline-binary "$BASELINE_BINARY" \
+            --candidate-binary "$CANDIDATE_BINARY" \
+            --pdf "$RUNNER_TEMP/research-gate/report/research-stress-${STRESS_PAGES}p.pdf" \
+            --warmups 2 \
+            --rounds 12 \
+            --max-ratio 1.01 \
+            --out "$RUNNER_TEMP/research-gate/report/latency-comparison.json"
+          rm -f "$RUNNER_TEMP/research-gate/report/research-stress-${STRESS_PAGES}p.pdf"
+
+      - name: Validate WebAssembly targets
+        run: |
+          set -euo pipefail
+          cargo check --target wasm32-unknown-unknown
+          cargo check --manifest-path wasm/Cargo.toml --target wasm32-unknown-unknown
+          cargo clippy --manifest-path wasm/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
+
+      - name: Record gate metadata
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/research-gate/report"
+          cp "$RUNNER_TEMP/research-gate/manifest.json" "$RUNNER_TEMP/research-gate/report/manifest.json" 2>/dev/null || true
+          {
+            echo "baseline_sha=${BASE_SHA:-unavailable}"
+            echo "candidate_sha=$GITHUB_SHA"
+            echo "upstream_sha=$(cat "$RUNNER_TEMP/research-gate/report/upstream-sha.txt" 2>/dev/null || echo unavailable)"
+            echo "arxiv_count=$ARXIV_COUNT"
+            echo "pmc_count=$PMC_COUNT"
+            echo "stress_pages=$STRESS_PAGES"
+            echo "rustc=$(rustc --version 2>/dev/null || true)"
+            echo "cpu=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p' | head -1)"
+          } > "$RUNNER_TEMP/research-gate/report/environment.txt"
+
+      - name: Upload comparison evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: research-parser-gate-${{ github.run_id }}
+          path: ${{ runner.temp }}/research-gate/report
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Publish validated parser change to main
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$BASE_SHA"
+          git worktree add --detach /tmp/pdf-release origin/main
+          cp src/markdown/classify.rs /tmp/pdf-release/src/markdown/classify.rs
+          cd /tmp/pdf-release
+          cargo fmt --all
+          git diff --check
+          test -n "$(git status --short -- src/markdown/classify.rs)"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- src/markdown/classify.rs
+          git commit -m 'fix: recognize scientific research captions'
+          git push origin HEAD:refs/heads/main

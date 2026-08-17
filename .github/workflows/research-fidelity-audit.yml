@@ -5,7 +5,7 @@ on:
     branches: [lab/research-fidelity-audit]
     paths:
       - 'benchmarks/research_fidelity/**'
-      - 'src/bin/research_audit.rs'
+      - 'src/**/*.rs'
       - 'Cargo.toml'
       - '.github/workflows/research-fidelity-audit.yml'
   workflow_dispatch:

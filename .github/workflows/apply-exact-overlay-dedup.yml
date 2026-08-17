@@ -1,0 +1,256 @@
+name: Apply exact overlay deduplication candidate
+
+on:
+  push:
+    branches: [lab/research-fidelity-audit]
+    paths:
+      - '.github/workflows/apply-exact-overlay-dedup.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Wait for cross-page candidate and refresh checkout
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 60); do
+            git fetch origin lab/research-fidelity-audit
+            if git show origin/lab/research-fidelity-audit:src/markdown/convert.rs | grep -q 'paragraph_continues_across_page'; then
+              git reset --hard origin/lab/research-fidelity-audit
+              exit 0
+            fi
+            echo "waiting for cross-page source candidate ($attempt/60)"
+            sleep 30
+          done
+          echo 'cross-page source candidate did not arrive' >&2
+          exit 1
+
+      - name: Apply allocation-free exact overlay deduplication
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          preprocess = Path('src/markdown/preprocess.rs')
+          source = preprocess.read_text()
+          source = source.replace(
+              'use crate::types::{TextItem, TextLine};',
+              'use crate::types::{ItemType, TextItem, TextLine};',
+              1,
+          )
+          anchor = '''/// Resolve a heading level for a line, considering both struct-tree roles and font heuristics.
+'''
+          addition = r'''#[derive(Hash, PartialEq, Eq)]
+struct ExactOverlayKey<'a> {
+    text: &'a str,
+    font: &'a str,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    font_size: u32,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    strikeout: bool,
+    mcid: Option<i64>,
+}
+
+/// Remove only byte-for-byte duplicate text paint operations from semantic
+/// Markdown input.
+///
+/// A number of PDF producers simulate heavier text by painting the same glyph
+/// run twice at the exact same coordinates. Humans see one word; preserving
+/// both operations emits duplicated prose and poisons token precision. The raw
+/// positioned-text API is intentionally untouched. This pass runs only after
+/// line construction in the Markdown pipeline.
+///
+/// Keys borrow the existing strings, so the common path allocates only one
+/// compact hash table and a keep bitmap per affected line—no text/font clones.
+pub(crate) fn deduplicate_exact_overlay_items(mut lines: Vec<TextLine>) -> Vec<TextLine> {
+    for line in &mut lines {
+        if line.items.len() < 2 {
+            continue;
+        }
+
+        let keep = {
+            let mut seen: HashSet<ExactOverlayKey<'_>> =
+                HashSet::with_capacity(line.items.len());
+            line.items
+                .iter()
+                .map(|item| {
+                    if !matches!(item.item_type, ItemType::Text) {
+                        return true;
+                    }
+                    seen.insert(ExactOverlayKey {
+                        text: &item.text,
+                        font: &item.font,
+                        x: item.x.to_bits(),
+                        y: item.y.to_bits(),
+                        width: item.width.to_bits(),
+                        height: item.height.to_bits(),
+                        font_size: item.font_size.to_bits(),
+                        bold: item.is_bold,
+                        italic: item.is_italic,
+                        underline: item.is_underline,
+                        strikeout: item.is_strikeout,
+                        mcid: item.mcid,
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut index = 0usize;
+        line.items.retain(|_| {
+            let retain = keep[index];
+            index += 1;
+            retain
+        });
+    }
+    lines.retain(|line| !line.items.is_empty());
+    lines
+}
+
+'''
+          if anchor not in source:
+              raise SystemExit('preprocess insertion anchor missing')
+          source = source.replace(anchor, addition + anchor, 1)
+
+          test_anchor = '''#[cfg(test)]
+mod tests {
+'''
+          if test_anchor not in source:
+              raise SystemExit('preprocess test module missing')
+          tests = r'''    #[test]
+    fn exact_overlay_deduplication_removes_only_identical_text_paints() {
+        let original = TextItem {
+            text: "Research fidelity".into(),
+            x: 72.0,
+            y: 700.0,
+            width: 80.0,
+            height: 12.0,
+            font: "Body".into(),
+            font_size: 12.0,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            item_type: ItemType::Text,
+            mcid: None,
+        };
+        let mut displaced = original.clone();
+        displaced.x += 100.0;
+        let line = TextLine {
+            items: vec![original.clone(), original, displaced],
+            y: 700.0,
+            page: 1,
+            adaptive_threshold: 0.1,
+        };
+        let result = deduplicate_exact_overlay_items(vec![line]);
+        assert_eq!(result[0].items.len(), 2);
+        assert_eq!(result[0].items[0].x, 72.0);
+        assert_eq!(result[0].items[1].x, 172.0);
+    }
+
+    #[test]
+    fn exact_overlay_deduplication_preserves_distinct_marked_content() {
+        let make = |mcid| TextItem {
+            text: "Tagged text".into(),
+            x: 72.0,
+            y: 700.0,
+            width: 60.0,
+            height: 12.0,
+            font: "Body".into(),
+            font_size: 12.0,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            item_type: ItemType::Text,
+            mcid,
+        };
+        let line = TextLine {
+            items: vec![make(Some(1)), make(Some(2))],
+            y: 700.0,
+            page: 1,
+            adaptive_threshold: 0.1,
+        };
+        let result = deduplicate_exact_overlay_items(vec![line]);
+        assert_eq!(result[0].items.len(), 2);
+    }
+
+'''
+          source = source.replace(test_anchor, test_anchor + tests, 1)
+          preprocess.write_text(source)
+
+          convert = Path('src/markdown/convert.rs')
+          source = convert.read_text()
+          old_import = '''use super::preprocess::{
+    merge_drop_caps, merge_heading_lines, merge_wrapped_caption_lines,
+};'''
+          if old_import in source:
+              new_import = '''use super::preprocess::{
+    deduplicate_exact_overlay_items, merge_drop_caps, merge_heading_lines,
+    merge_wrapped_caption_lines,
+};'''
+              source = source.replace(old_import, new_import, 1)
+          else:
+              old_import = 'use super::preprocess::{merge_drop_caps, merge_heading_lines, merge_wrapped_caption_lines};'
+              if old_import not in source:
+                  raise SystemExit('convert preprocess import anchor missing')
+              source = source.replace(
+                  old_import,
+                  'use super::preprocess::{deduplicate_exact_overlay_items, merge_drop_caps, merge_heading_lines, merge_wrapped_caption_lines};',
+                  1,
+              )
+
+          stats_anchor = '''    // Calculate font statistics
+    let font_stats = calculate_font_stats(&lines);
+'''
+          count = source.count(stats_anchor)
+          if count != 2:
+              raise SystemExit(f'expected two font-stat anchors, found {count}')
+          source = source.replace(
+              stats_anchor,
+              '''    // Exact duplicate paint operations are visual effects, not semantic text.
+    let lines = deduplicate_exact_overlay_items(lines);
+    if lines.is_empty() {
+        return String::new();
+    }
+
+''' + stats_anchor,
+          )
+          convert.write_text(source)
+          PY
+
+      - name: Format and validate candidate
+        run: |
+          set -euo pipefail
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo clippy -- -D warnings
+          cargo test
+
+      - name: Commit validated source candidate
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- src/markdown/preprocess.rs src/markdown/convert.rs
+          git commit -m 'fix: remove exact duplicate text overlays from markdown'
+          git push origin HEAD:lab/research-fidelity-audit

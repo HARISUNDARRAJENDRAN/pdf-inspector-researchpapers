@@ -1,0 +1,224 @@
+name: Promote combined fidelity fallback
+
+on:
+  push:
+    branches: [lab/research-fidelity-audit]
+    paths:
+      - '.github/workflows/promote-combined-fidelity-fallback.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  CARGO_TERM_COLOR: always
+  RAYON_NUM_THREADS: '2'
+  MALLOC_ARENA_MAX: '2'
+
+concurrency:
+  group: promote-combined-fidelity-fallback
+  cancel-in-progress: false
+
+jobs:
+  validate-and-promote:
+    runs-on: ubuntu-latest
+    timeout-minutes: 210
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: benchmarks/research_fidelity/requirements.txt
+
+      - name: Wait for source candidate and earlier promotion attempts
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 120); do
+            git fetch origin lab/research-fidelity-audit main
+            source_ready=0
+            git show origin/lab/research-fidelity-audit:src/markdown/convert.rs | grep -q 'paragraph_continues_across_page' && source_ready=1 || true
+            active=0
+            for workflow in promote-caption-fidelity.yml promote-cross-page-paragraph.yml; do
+              count=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow/runs?per_page=10" --jq '[.workflow_runs[] | select(.status == "queued" or .status == "in_progress")] | length' 2>/dev/null || echo 0)
+              active=$((active + count))
+            done
+            if [[ "$source_ready" -eq 1 && "$active" -eq 0 ]]; then
+              git reset --hard origin/lab/research-fidelity-audit
+              if git show origin/main:src/markdown/convert.rs | grep -q 'paragraph_continues_across_page'; then
+                echo 'combined changes already promoted by earlier workflow'
+                echo already-promoted > /tmp/combined-noop.txt
+                exit 0
+              fi
+              exit 0
+            fi
+            echo "waiting: source_ready=$source_ready active_promotions=$active ($attempt/120)"
+            sleep 60
+          done
+          exit 1
+
+      - name: Stop after no-op
+        if: ${{ hashFiles('/tmp/combined-noop.txt') != '' }}
+        run: exit 0
+
+      - name: Install evaluation dependencies
+        if: ${{ hashFiles('/tmp/combined-noop.txt') == '' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pandoc
+          python -m pip install --upgrade pip
+          python -m pip install -r benchmarks/research_fidelity/requirements.txt
+
+      - name: Prepare main and combined candidate
+        if: ${{ hashFiles('/tmp/combined-noop.txt') == '' }}
+        run: |
+          set -euo pipefail
+          git fetch origin main lab/research-fidelity-audit
+          git worktree add --detach /tmp/combined-main origin/main
+          git worktree add --detach /tmp/combined-candidate origin/lab/research-fidelity-audit
+          cd /tmp/combined-candidate
+          cargo fmt --all -- --check
+          cargo clippy -- -D warnings
+          cargo test
+
+      - name: Build both parsers
+        if: ${{ hashFiles('/tmp/combined-noop.txt') == '' }}
+        run: |
+          CARGO_TARGET_DIR=/tmp/combined-target-main cargo build --release --manifest-path /tmp/combined-main/Cargo.toml --bin research-audit --bin pdf2md
+          CARGO_TARGET_DIR=/tmp/combined-target-candidate cargo build --release --manifest-path /tmp/combined-candidate/Cargo.toml --bin research-audit --bin pdf2md
+
+      - name: Download shared 100-paper corpus
+        if: ${{ hashFiles('/tmp/combined-noop.txt') == '' }}
+        run: |
+          mkdir -p /tmp/combined-corpus
+          python /tmp/combined-candidate/benchmarks/research_fidelity/audit.py select --arxiv 60 --pmc 40 --out /tmp/combined-manifest.json
+          python /tmp/combined-candidate/benchmarks/research_fidelity/audit.py download --manifest /tmp/combined-manifest.json --root /tmp/combined-corpus
+
+      - name: Evaluate baseline and combined candidate
+        if: ${{ hashFiles('/tmp/combined-noop.txt') == '' }}
+        run: |
+          python /tmp/combined-candidate/benchmarks/research_fidelity/audit.py evaluate --manifest /tmp/combined-manifest.json --root /tmp/combined-corpus --fork-binary /tmp/combined-target-main/release/research-audit --upstream-binary /tmp/combined-target-main/release/pdf2md --out /tmp/combined-main.jsonl
+          python /tmp/combined-candidate/benchmarks/research_fidelity/audit.py evaluate --manifest /tmp/combined-manifest.json --root /tmp/combined-corpus --fork-binary /tmp/combined-target-candidate/release/research-audit --upstream-binary /tmp/combined-target-candidate/release/pdf2md --out /tmp/combined-candidate.jsonl
+
+      - name: Gate combined fidelity
+        if: ${{ hashFiles('/tmp/combined-noop.txt') == '' }}
+        run: |
+          python - <<'PY'
+          import json,math,statistics
+          from pathlib import Path
+          names=('overall_score','word_precision','word_f1','bigram_f1','sequence_similarity','paragraph_precision','paragraph_recall','paragraph_f1','heading_f1','caption_f1','table_score','equation_score','tail_recall','cleanliness')
+          def walk(v,p=()):
+              if isinstance(v,dict):
+                  m=v.get('metrics') if isinstance(v.get('metrics'),dict) else v
+                  if isinstance(m,dict) and isinstance(m.get('overall_score'),(int,float)):
+                      label='/'.join(map(str,p))
+                      for k in ('implementation','name','mode','variant','parser'):
+                          if v.get(k) is not None:label+='/'+str(v[k])
+                      yield label.casefold(),m
+                  for k,c in v.items():yield from walk(c,(*p,k))
+              elif isinstance(v,list):
+                  for i,c in enumerate(v):yield from walk(c,(*p,i))
+          def rows(path):
+              out=[]
+              for raw in Path(path).read_text().splitlines():
+                  if not raw.strip():continue
+                  cs=[(l,m) for l,m in walk(json.loads(raw)) if 'research' in l and 'upstream' not in l]
+                  if not cs:continue
+                  cs.sort(key=lambda x:('fast' in x[0],-len(x[0])),reverse=True);m=cs[0][1]
+                  if all(isinstance(m.get(n),(int,float)) and math.isfinite(float(m[n])) for n in names):out.append(m)
+              if len(out)<90:raise RuntimeError(f'only {len(out)} rows')
+              return out
+          base=rows('/tmp/combined-main.jsonl');cand=rows('/tmp/combined-candidate.jsonl');mean=lambda rs:{n:statistics.fmean(float(r[n]) for r in rs) for n in names};bm,cm=mean(base),mean(cand)
+          for n in names:print(f'{n}: main={bm[n]:.8f} candidate={cm[n]:.8f} delta={cm[n]-bm[n]:+.8f}')
+          if cm['overall_score']<bm['overall_score']+0.00010:raise RuntimeError('combined candidate does not materially improve overall fidelity')
+          if cm['paragraph_f1']+cm['caption_f1']<bm['paragraph_f1']+bm['caption_f1']+0.00020:raise RuntimeError('combined paragraph/caption fidelity did not improve')
+          for n in ('word_precision','word_f1','bigram_f1','sequence_similarity','heading_f1','table_score','equation_score','tail_recall','cleanliness'):
+              if cm[n]+0.00075<bm[n]:raise RuntimeError(f'protected metric regressed: {n}')
+          Path('/tmp/combined-fidelity.json').write_text(json.dumps({'papers':len(base),'main':bm,'candidate':cm,'delta':{n:cm[n]-bm[n] for n in names}},indent=2)+'\n')
+          PY
+
+      - name: Gate paired latency
+        if: ${{ hashFiles('/tmp/combined-noop.txt') == '' }}
+        run: |
+          set -euo pipefail
+          for dir in /tmp/combined-main /tmp/combined-candidate; do
+            cat > "$dir/src/bin/combined_latency.rs" <<'RS'
+          use pdf_inspector::process_research_pdf;
+          use std::{env,time::Instant};
+          fn main(){let paths:Vec<String>=env::args().skip(1).collect();let start=Instant::now();let mut bytes=0usize;for path in paths{bytes+=process_research_pdf(&path).unwrap().markdown.unwrap().len();}println!("{} {}",start.elapsed().as_nanos(),bytes);}
+          RS
+            cat >> "$dir/Cargo.toml" <<'TOML'
+
+          [[bin]]
+          name = "combined-latency"
+          path = "src/bin/combined_latency.rs"
+          TOML
+          done
+          CARGO_TARGET_DIR=/tmp/combined-latency-main cargo build --release --manifest-path /tmp/combined-main/Cargo.toml --bin combined-latency
+          CARGO_TARGET_DIR=/tmp/combined-latency-candidate cargo build --release --manifest-path /tmp/combined-candidate/Cargo.toml --bin combined-latency
+          python - <<'PY'
+          import json,os,statistics,subprocess
+          from pathlib import Path
+          manifest=json.loads(Path('/tmp/combined-manifest.json').read_text());root=Path('/tmp/combined-corpus');papers=[]
+          for item in manifest['papers']:
+              if item.get('download_status')=='ok' and item.get('provider')=='arxiv':
+                  p=root/item['pdf_path']
+                  if p.exists():papers.append(str(p))
+              if len(papers)==5:break
+          bins={'main':'/tmp/combined-latency-main/release/combined-latency','candidate':'/tmp/combined-latency-candidate/release/combined-latency'}
+          def run(label):out=subprocess.check_output([bins[label],*papers],text=True,env=os.environ).split();assert int(out[1])>0;return int(out[0])
+          for _ in range(3):run('main');run('candidate')
+          s={'main':[],'candidate':[]}
+          for i in range(24):
+              for label in (('main','candidate') if i%2==0 else ('candidate','main')):s[label].append(run(label))
+          bm=statistics.median(s['main']);cm=statistics.median(s['candidate']);delta=(cm-bm)/bm
+          print(f'median main={bm/1e6:.3f}ms candidate={cm/1e6:.3f}ms delta={delta*100:+.3f}%')
+          if cm>bm*1.01:raise RuntimeError('latency regressed by more than 1%')
+          Path('/tmp/combined-latency.json').write_text(json.dumps({'main_median_ms':bm/1e6,'candidate_median_ms':cm/1e6,'delta_percent':delta*100},indent=2)+'\n')
+          PY
+
+      - name: Push one clean combined production commit
+        if: ${{ hashFiles('/tmp/combined-noop.txt') == '' }}
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git worktree add -b release/combined-fidelity /tmp/combined-release origin/main
+          cp /tmp/combined-candidate/src/markdown/classify.rs /tmp/combined-release/src/markdown/classify.rs
+          cp /tmp/combined-candidate/src/markdown/preprocess.rs /tmp/combined-release/src/markdown/preprocess.rs
+          cp /tmp/combined-candidate/src/markdown/convert.rs /tmp/combined-release/src/markdown/convert.rs
+          cd /tmp/combined-release
+          cargo fmt --all -- --check
+          cargo clippy -- -D warnings
+          cargo test
+          mapfile -t changed < <(git diff --name-only)
+          allowed='src/markdown/classify.rs src/markdown/convert.rs src/markdown/preprocess.rs'
+          for file in "${changed[@]}"; do [[ " $allowed " == *" $file "* ]] || { echo "unexpected $file"; exit 1; }; done
+          [[ "${#changed[@]}" -gt 0 ]]
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- src/markdown/classify.rs src/markdown/convert.rs src/markdown/preprocess.rs
+          git commit -m 'feat: improve research caption and paragraph fidelity'
+          git push origin HEAD:main
+          git rev-parse HEAD > /tmp/combined-promoted-sha.txt
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: combined-fidelity-promotion-${{ github.run_id }}
+          path: |
+            /tmp/combined-fidelity.json
+            /tmp/combined-latency.json
+            /tmp/combined-promoted-sha.txt
+            /tmp/combined-noop.txt
+          if-no-files-found: warn
+          retention-days: 30

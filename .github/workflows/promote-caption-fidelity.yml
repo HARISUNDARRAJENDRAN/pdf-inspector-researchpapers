@@ -1,0 +1,359 @@
+name: Promote validated scientific-caption fidelity
+
+on:
+  push:
+    branches: [lab/research-fidelity-audit]
+    paths:
+      - '.github/workflows/promote-caption-fidelity.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RAYON_NUM_THREADS: '2'
+  MALLOC_ARENA_MAX: '2'
+
+concurrency:
+  group: promote-caption-fidelity
+  cancel-in-progress: false
+
+jobs:
+  validate-and-promote:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+
+    steps:
+      - name: Check out candidate branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: benchmarks/research_fidelity/requirements.txt
+
+      - name: Install evaluation dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pandoc
+          python -m pip install --upgrade pip
+          python -m pip install -r benchmarks/research_fidelity/requirements.txt
+
+      - name: Prepare untouched main and candidate worktrees
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git worktree add --detach /tmp/pdf-main origin/main
+          git worktree add --detach /tmp/pdf-candidate "$GITHUB_SHA"
+
+      - name: Validate candidate source
+        working-directory: /tmp/pdf-candidate
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo clippy -- -D warnings
+          cargo test
+
+      - name: Build baseline and candidate audit binaries
+        run: |
+          set -euo pipefail
+          CARGO_TARGET_DIR=/tmp/target-main cargo build --release --manifest-path /tmp/pdf-main/Cargo.toml --bin research-audit --bin pdf2md
+          CARGO_TARGET_DIR=/tmp/target-candidate cargo build --release --manifest-path /tmp/pdf-candidate/Cargo.toml --bin research-audit --bin pdf2md
+
+      - name: Select and download one shared 100-paper corpus
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/research-corpus
+          python /tmp/pdf-candidate/benchmarks/research_fidelity/audit.py select \
+            --arxiv 60 \
+            --pmc 40 \
+            --out /tmp/research-manifest.json
+          python /tmp/pdf-candidate/benchmarks/research_fidelity/audit.py download \
+            --manifest /tmp/research-manifest.json \
+            --root /tmp/research-corpus
+
+      - name: Evaluate untouched main on shared corpus
+        run: |
+          set -euo pipefail
+          python /tmp/pdf-candidate/benchmarks/research_fidelity/audit.py evaluate \
+            --manifest /tmp/research-manifest.json \
+            --root /tmp/research-corpus \
+            --fork-binary /tmp/target-main/release/research-audit \
+            --upstream-binary /tmp/target-main/release/pdf2md \
+            --out /tmp/main-results.jsonl
+
+      - name: Evaluate candidate on shared corpus
+        run: |
+          set -euo pipefail
+          python /tmp/pdf-candidate/benchmarks/research_fidelity/audit.py evaluate \
+            --manifest /tmp/research-manifest.json \
+            --root /tmp/research-corpus \
+            --fork-binary /tmp/target-candidate/release/research-audit \
+            --upstream-binary /tmp/target-candidate/release/pdf2md \
+            --out /tmp/candidate-results.jsonl
+
+      - name: Gate source-grounded fidelity
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import json
+          import math
+          import statistics
+          from pathlib import Path
+
+          METRICS = (
+              'overall_score', 'word_f1', 'bigram_f1', 'sequence_similarity',
+              'paragraph_f1', 'heading_f1', 'caption_f1', 'table_score',
+              'equation_score', 'tail_recall', 'cleanliness',
+          )
+
+          def records(path: str):
+              out = []
+              for line in Path(path).read_text().splitlines():
+                  line = line.strip()
+                  if line:
+                      out.append(json.loads(line))
+              return out
+
+          def walk(value, path=()):
+              if isinstance(value, dict):
+                  metrics = value.get('metrics') if isinstance(value.get('metrics'), dict) else value
+                  if isinstance(metrics, dict) and isinstance(metrics.get('overall_score'), (int, float)):
+                      label_parts = [str(part) for part in path]
+                      for key in ('implementation', 'name', 'mode', 'variant', 'parser'):
+                          if value.get(key) is not None:
+                              label_parts.append(str(value[key]))
+                      yield '/'.join(label_parts).casefold(), metrics
+                  for key, child in value.items():
+                      yield from walk(child, (*path, key))
+              elif isinstance(value, list):
+                  for index, child in enumerate(value):
+                      yield from walk(child, (*path, index))
+
+          def research_metrics(record):
+              candidates = list(walk(record))
+              preferred = [pair for pair in candidates if 'research' in pair[0] and 'upstream' not in pair[0]]
+              if not preferred:
+                  raise RuntimeError('research metrics not found; candidates=' + repr([label for label, _ in candidates]))
+              preferred.sort(key=lambda pair: (('fast' in pair[0]), ('research' in pair[0]), -len(pair[0])), reverse=True)
+              return preferred[0][1]
+
+          def aggregate(path: str):
+              rows = []
+              for record in records(path):
+                  try:
+                      metrics = research_metrics(record)
+                  except Exception as exc:
+                      print('skipping record without research metrics:', exc)
+                      continue
+                  if all(isinstance(metrics.get(name), (int, float)) and math.isfinite(float(metrics[name])) for name in METRICS):
+                      rows.append(metrics)
+              if len(rows) < 90:
+                  raise RuntimeError(f'only {len(rows)} valid research-paper rows in {path}')
+              return {name: statistics.fmean(float(row[name]) for row in rows) for name in METRICS}, len(rows)
+
+          baseline, baseline_count = aggregate('/tmp/main-results.jsonl')
+          candidate, candidate_count = aggregate('/tmp/candidate-results.jsonl')
+          common_count = min(baseline_count, candidate_count)
+
+          print(f'validated rows: main={baseline_count}, candidate={candidate_count}')
+          for name in METRICS:
+              delta = candidate[name] - baseline[name]
+              print(f'{name}: main={baseline[name]:.8f} candidate={candidate[name]:.8f} delta={delta:+.8f}')
+
+          # A production promotion must improve the weighted score, improve the
+          # two metrics this change targets, and preserve unrelated semantics.
+          if candidate['overall_score'] < baseline['overall_score'] + 0.00005:
+              raise RuntimeError('candidate does not improve aggregate source-grounded fidelity')
+          if candidate['caption_f1'] + candidate['paragraph_f1'] < baseline['caption_f1'] + baseline['paragraph_f1'] + 0.00010:
+              raise RuntimeError('candidate does not improve caption/paragraph fidelity')
+
+          protected = (
+              'word_f1', 'bigram_f1', 'sequence_similarity', 'heading_f1',
+              'table_score', 'equation_score', 'tail_recall', 'cleanliness',
+          )
+          for name in protected:
+              if candidate[name] + 0.00075 < baseline[name]:
+                  raise RuntimeError(f'candidate regresses protected metric {name}')
+
+          summary = {
+              'papers': common_count,
+              'baseline': baseline,
+              'candidate': candidate,
+              'delta': {name: candidate[name] - baseline[name] for name in METRICS},
+          }
+          Path('/tmp/fidelity-gate.json').write_text(json.dumps(summary, indent=2) + '\n')
+          PY
+
+      - name: Add identical latency drivers
+        run: |
+          set -euo pipefail
+          for dir in /tmp/pdf-main /tmp/pdf-candidate; do
+            cat > "$dir/src/bin/research_candidate_bench.rs" <<'RS'
+          use pdf_inspector::process_research_pdf;
+          use std::env;
+          use std::time::Instant;
+
+          const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+          const FNV_PRIME: u64 = 0x100000001b3;
+
+          fn hash(mut value: u64, bytes: &[u8]) -> u64 {
+              for &byte in bytes {
+                  value ^= u64::from(byte);
+                  value = value.wrapping_mul(FNV_PRIME);
+              }
+              value
+          }
+
+          fn main() {
+              let paths: Vec<String> = env::args().skip(1).collect();
+              assert!(!paths.is_empty());
+              let started = Instant::now();
+              let mut digest = FNV_OFFSET;
+              let mut bytes = 0usize;
+              for path in &paths {
+                  let result = process_research_pdf(path).expect("research parse");
+                  let markdown = result.markdown.expect("markdown");
+                  bytes += markdown.len();
+                  digest = hash(digest, markdown.as_bytes());
+              }
+              println!("{} {} {}", started.elapsed().as_nanos(), digest, bytes);
+          }
+          RS
+            cat >> "$dir/Cargo.toml" <<'TOML'
+
+          [[bin]]
+          name = "research-candidate-bench"
+          path = "src/bin/research_candidate_bench.rs"
+          TOML
+          done
+          CARGO_TARGET_DIR=/tmp/latency-main cargo build --release --manifest-path /tmp/pdf-main/Cargo.toml --bin research-candidate-bench
+          CARGO_TARGET_DIR=/tmp/latency-candidate cargo build --release --manifest-path /tmp/pdf-candidate/Cargo.toml --bin research-candidate-bench
+
+      - name: Gate paired research-paper latency
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import json
+          import os
+          import statistics
+          import subprocess
+          from pathlib import Path
+
+          manifest = json.loads(Path('/tmp/research-manifest.json').read_text())
+          root = Path('/tmp/research-corpus')
+          papers = []
+          for item in manifest.get('papers', []):
+              if item.get('download_status') == 'ok' and item.get('provider') == 'arxiv':
+                  path = root / item['pdf_path']
+                  if path.exists():
+                      papers.append(str(path))
+              if len(papers) == 5:
+                  break
+          if len(papers) != 5:
+              raise RuntimeError(f'expected five arXiv latency papers, found {len(papers)}')
+
+          binaries = {
+              'main': '/tmp/latency-main/release/research-candidate-bench',
+              'candidate': '/tmp/latency-candidate/release/research-candidate-bench',
+          }
+
+          def run(label):
+              completed = subprocess.run(
+                  [binaries[label], *papers], text=True, stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE, env=os.environ.copy(), check=False,
+              )
+              if completed.returncode:
+                  raise RuntimeError(f'{label} failed: {completed.stderr}')
+              elapsed, digest, size = completed.stdout.strip().split()
+              return int(elapsed), int(digest), int(size)
+
+          for _ in range(3):
+              run('main'); run('candidate')
+
+          samples = {'main': [], 'candidate': []}
+          for round_index in range(24):
+              order = ('main', 'candidate') if round_index % 2 == 0 else ('candidate', 'main')
+              for label in order:
+                  elapsed, _, size = run(label)
+                  if size <= 0:
+                      raise RuntimeError(f'{label} emitted empty markdown')
+                  samples[label].append(elapsed)
+
+          def percentile(values, quantile):
+              ordered = sorted(values)
+              index = int(round((len(ordered) - 1) * quantile))
+              return ordered[index]
+
+          main_median = statistics.median(samples['main'])
+          candidate_median = statistics.median(samples['candidate'])
+          main_p90 = percentile(samples['main'], 0.90)
+          candidate_p90 = percentile(samples['candidate'], 0.90)
+          median_delta = (candidate_median - main_median) / main_median
+          p90_delta = (candidate_p90 - main_p90) / main_p90
+          print(f'paired median: main={main_median/1e6:.3f}ms candidate={candidate_median/1e6:.3f}ms delta={median_delta*100:+.3f}%')
+          print(f'paired p90: main={main_p90/1e6:.3f}ms candidate={candidate_p90/1e6:.3f}ms delta={p90_delta*100:+.3f}%')
+          if candidate_median > main_median * 1.01:
+              raise RuntimeError('candidate regresses median latency by more than 1%')
+          if candidate_p90 > main_p90 * 1.03:
+              raise RuntimeError('candidate regresses p90 latency by more than 3%')
+          Path('/tmp/latency-gate.json').write_text(json.dumps({
+              'main_median_ms': main_median / 1e6,
+              'candidate_median_ms': candidate_median / 1e6,
+              'median_delta_percent': median_delta * 100,
+              'main_p90_ms': main_p90 / 1e6,
+              'candidate_p90_ms': candidate_p90 / 1e6,
+              'p90_delta_percent': p90_delta * 100,
+              'samples_ms': {key: [value / 1e6 for value in values] for key, values in samples.items()},
+          }, indent=2) + '\n')
+          PY
+
+      - name: Create clean production commit on current main
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git worktree add -b release/scientific-caption-fidelity /tmp/pdf-release origin/main
+          cp /tmp/pdf-candidate/src/markdown/classify.rs /tmp/pdf-release/src/markdown/classify.rs
+          cp /tmp/pdf-candidate/src/markdown/preprocess.rs /tmp/pdf-release/src/markdown/preprocess.rs
+          cp /tmp/pdf-candidate/src/markdown/convert.rs /tmp/pdf-release/src/markdown/convert.rs
+          cd /tmp/pdf-release
+          cargo fmt --all -- --check
+          cargo clippy -- -D warnings
+          cargo test
+          mapfile -t changed < <(git diff --name-only)
+          expected=(src/markdown/classify.rs src/markdown/convert.rs src/markdown/preprocess.rs)
+          if [[ "${changed[*]}" != "${expected[*]}" ]]; then
+            printf 'unexpected production diff:\n%s\n' "${changed[*]}" >&2
+            exit 1
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- src/markdown/classify.rs src/markdown/convert.rs src/markdown/preprocess.rs
+          git commit -m 'feat: improve scientific caption fidelity'
+          git push origin HEAD:main
+          git rev-parse HEAD > /tmp/promoted-sha.txt
+
+      - name: Publish validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scientific-caption-promotion-${{ github.run_id }}
+          path: |
+            /tmp/fidelity-gate.json
+            /tmp/latency-gate.json
+            /tmp/promoted-sha.txt
+          if-no-files-found: warn
+          retention-days: 30

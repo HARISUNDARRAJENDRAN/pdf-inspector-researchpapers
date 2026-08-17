@@ -22,6 +22,7 @@ class ReferenceParsingTests(unittest.TestCase):
           <div class="ltx_authors">Ada Author, Example University</div>
           <h2>1 Introduction</h2>
           <p>This is a paragraph with <math alttext="x = y + 1">x=y+1</math>.</p>
+          <p>This realistic article fixture contains enough ordinary research prose to satisfy the source-quality guard while still remaining compact enough for a focused unit test of headings, equations, captions, and data tables.</p>
           <figure><figcaption>Figure 1: Model.</figcaption></figure>
           <table><tr><th>A</th><th>B</th></tr><tr><td>1</td><td>2</td></tr></table>
           <table class="ltx_eqn_table ltx_equation"><tr><td>x = y + 1</td></tr></table>
@@ -73,7 +74,7 @@ class MetricTests(unittest.TestCase):
             headings=["A Paper", "Introduction"],
             paragraphs=["This method predicts stable networks"],
             captions=["Figure 1 Model"],
-            tables=[[ ["A", "B"], ["1", "2"] ]],
+            tables=[[["A", "B"], ["1", "2"]]],
             equations=["x = y + 1"],
             reference_kind="test",
             reference_quality="test",

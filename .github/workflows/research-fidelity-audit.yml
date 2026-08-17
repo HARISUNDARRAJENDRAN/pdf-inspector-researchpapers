@@ -62,6 +62,9 @@ jobs:
           cache: pip
           cache-dependency-path: benchmarks/research_fidelity/requirements.txt
 
+      - name: Prepare audit directories
+        run: mkdir -p "${{ runner.temp }}/research-audit/report"
+
       - name: Install source conversion tools
         run: |
           sudo apt-get update
@@ -95,7 +98,6 @@ jobs:
 
       - name: Select diverse 100-paper corpus
         run: |
-          mkdir -p "${{ runner.temp }}/research-audit/report"
           python benchmarks/research_fidelity/audit.py select \
             --arxiv "$ARXIV_COUNT" \
             --pmc "$PMC_COUNT" \
@@ -145,6 +147,7 @@ jobs:
       - name: Record reproducibility metadata
         if: always()
         run: |
+          mkdir -p "${{ runner.temp }}/research-audit/report"
           {
             echo "fork_sha=$GITHUB_SHA"
             echo "upstream_sha=$(cat '${{ runner.temp }}/upstream-sha.txt' 2>/dev/null || echo unavailable)"

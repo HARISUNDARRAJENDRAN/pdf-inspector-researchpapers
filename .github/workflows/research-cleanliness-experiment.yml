@@ -1,0 +1,349 @@
+name: Research parser cleanliness experiment
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [opt/research-cleanliness]
+    paths: ['.github/workflows/research-cleanliness-experiment.yml']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  RAYON_NUM_THREADS: '2'
+  MALLOC_ARENA_MAX: '2'
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: benchmarks/research_fidelity/requirements.txt
+
+      - name: Install audit dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pandoc time
+          python -m pip install --upgrade pip
+          python -m pip install -r benchmarks/research_fidelity/requirements.txt
+
+      - name: Prepare baseline and candidate
+        run: |
+          set -euo pipefail
+          git fetch origin main lab/research-fidelity-audit
+          BASE_SHA=$(git rev-parse origin/main)
+          echo "BASE_SHA=$BASE_SHA" >> "$GITHUB_ENV"
+          git worktree add --detach /tmp/pdf-baseline "$BASE_SHA"
+          git worktree add --detach /tmp/pdf-candidate "$BASE_SHA"
+          git show origin/lab/research-fidelity-audit:benchmarks/research_fidelity/compare_candidate.py > /tmp/compare_candidate.py
+          mkdir -p "$RUNNER_TEMP/cleanliness-experiment/report"
+
+      - name: Apply allocation-conscious semantic cleanup
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          preprocess = Path('/tmp/pdf-candidate/src/markdown/preprocess.rs')
+          source = preprocess.read_text()
+          source = source.replace(
+              'use crate::types::{TextItem, TextLine};\n',
+              'use crate::types::{ItemType, TextItem, TextLine};\n',
+              1,
+          )
+          anchor = 'use super::analysis::detect_header_level;\n'
+          implementation = r'''use super::analysis::detect_header_level;
+
+#[derive(Debug, Hash, PartialEq, Eq)]
+struct ExactOverlayKey<'a> {
+    text: &'a str,
+    font: &'a str,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    font_size: i32,
+    page: u32,
+    is_bold: bool,
+    is_italic: bool,
+    is_underline: bool,
+    is_strikeout: bool,
+    mcid: Option<i64>,
+}
+
+fn quantized(value: f32, scale: f32) -> i32 {
+    if value.is_finite() {
+        (value * scale).round() as i32
+    } else {
+        0
+    }
+}
+
+fn overlay_key(item: &TextItem) -> ExactOverlayKey<'_> {
+    ExactOverlayKey {
+        text: item.text.as_str(),
+        font: item.font.as_str(),
+        x: quantized(item.x, 100.0),
+        y: quantized(item.y, 100.0),
+        width: quantized(item.width, 100.0),
+        height: quantized(item.height, 100.0),
+        font_size: quantized(item.font_size, 100.0),
+        page: item.page,
+        is_bold: item.is_bold,
+        is_italic: item.is_italic,
+        is_underline: item.is_underline,
+        is_strikeout: item.is_strikeout,
+        mcid: item.mcid,
+    }
+}
+
+fn adjacent_overlay_candidate(left: &TextItem, right: &TextItem) -> bool {
+    matches!((&left.item_type, &right.item_type), (ItemType::Text, ItemType::Text))
+        && left.text == right.text
+        && (left.x - right.x).abs() <= 0.02
+        && (left.y - right.y).abs() <= 0.02
+}
+
+/// Remove duplicate paint operations only from the semantic Markdown stream.
+///
+/// Some PDF producers draw the same glyph run twice at the same coordinates to
+/// simulate a heavier face. Humans see one word; a text parser otherwise emits
+/// it twice. The raw positioned-text API remains untouched. Ordinary lines pay
+/// only an adjacent-window scan; the borrowed-key set is allocated solely when
+/// duplicate geometry is actually present.
+pub(crate) fn remove_exact_duplicate_overlays(mut lines: Vec<TextLine>) -> Vec<TextLine> {
+    for line in &mut lines {
+        if line.items.len() < 2
+            || !line
+                .items
+                .windows(2)
+                .any(|pair| adjacent_overlay_candidate(&pair[0], &pair[1]))
+        {
+            continue;
+        }
+
+        let mut keep = Vec::with_capacity(line.items.len());
+        {
+            let mut seen = HashSet::with_capacity(line.items.len());
+            for item in &line.items {
+                if !matches!(&item.item_type, ItemType::Text) {
+                    keep.push(true);
+                    continue;
+                }
+                keep.push(seen.insert(overlay_key(item)));
+            }
+        }
+
+        let mut index = 0usize;
+        line.items.retain(|_| {
+            let retain = keep[index];
+            index += 1;
+            retain
+        });
+    }
+    lines.retain(|line| !line.items.is_empty());
+    lines
+}
+
+'''
+          if source.count(anchor) != 1:
+              raise SystemExit('preprocess anchor changed')
+          source = source.replace(anchor, implementation, 1)
+          source += r'''
+
+#[cfg(test)]
+mod exact_overlay_tests {
+    use super::*;
+
+    fn item(text: &str, x: f32, mcid: Option<i64>, bold: bool) -> TextItem {
+        TextItem {
+            text: text.to_owned(),
+            x,
+            y: 700.0,
+            width: 32.0,
+            height: 10.0,
+            font: "Body".to_owned(),
+            font_size: 10.0,
+            page: 1,
+            is_bold: bold,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            item_type: ItemType::Text,
+            mcid,
+        }
+    }
+
+    fn line(items: Vec<TextItem>) -> TextLine {
+        TextLine {
+            items,
+            y: 700.0,
+            page: 1,
+            adaptive_threshold: 0.1,
+        }
+    }
+
+    #[test]
+    fn removes_only_exact_duplicate_paint_operation() {
+        let duplicate = item("HELLO", 72.0, None, false);
+        let lines = remove_exact_duplicate_overlays(vec![line(vec![
+            duplicate.clone(),
+            duplicate,
+            item("HELLO", 172.0, None, false),
+        ])]);
+        assert_eq!(lines[0].items.len(), 2);
+        assert_eq!(lines[0].items[0].x, 72.0);
+        assert_eq!(lines[0].items[1].x, 172.0);
+    }
+
+    #[test]
+    fn preserves_distinct_structure_and_style() {
+        let lines = remove_exact_duplicate_overlays(vec![line(vec![
+            item("Label", 72.0, Some(1), false),
+            item("Label", 72.0, Some(2), false),
+            item("Label", 72.0, Some(1), true),
+        ])]);
+        assert_eq!(lines[0].items.len(), 3);
+    }
+}
+'''
+          preprocess.write_text(source)
+
+          convert = Path('/tmp/pdf-candidate/src/markdown/convert.rs')
+          source = convert.read_text()
+          old_import = 'use super::preprocess::{merge_drop_caps, merge_heading_lines};\n'
+          new_import = '''use super::preprocess::{\n    merge_drop_caps, merge_heading_lines, remove_exact_duplicate_overlays,\n};\n'''
+          if source.count(old_import) != 1:
+              raise SystemExit('convert preprocess import anchor changed')
+          source = source.replace(old_import, new_import, 1)
+          stats_anchor = '    // Calculate font statistics\n    let font_stats = calculate_font_stats(&lines);\n'
+          stats_replacement = '''    // Exact same-coordinate overprints are a rendering technique, not\n    // duplicate semantic content. Remove them before they can skew font\n    // statistics or reach Markdown.\n    let lines = remove_exact_duplicate_overlays(lines);\n\n    // Calculate font statistics\n    let font_stats = calculate_font_stats(&lines);\n'''
+          if source.count(stats_anchor) != 2:
+              raise SystemExit(f'expected two font-stat anchors, found {source.count(stats_anchor)}')
+          source = source.replace(stats_anchor, stats_replacement)
+          convert.write_text(source)
+
+          extractor = Path('/tmp/pdf-candidate/src/extractor/mod.rs')
+          source = extractor.read_text()
+          old = '''                let coherent =\n                    off.len() >= 10 && wordy_chars * 2 >= total_chars.max(1) && !straddles;\n'''
+          new = '''                let dense_neighbor_page =\n                    off.len() >= 10 && wordy_chars * 2 >= total_chars.max(1);\n                // A hidden publisher phrase can be one complete Tj/TJ item,\n                // so item count alone is not a safe coherence test. Require a\n                // substantial, word-like, alphabetic phrase before clipping\n                // sparse off-page material; isolated math glyphs remain.\n                let sparse_words: usize = off\n                    .iter()\n                    .map(|item| {\n                        item.text\n                            .split_whitespace()\n                            .filter(|word| word.chars().any(char::is_alphabetic))\n                            .count()\n                    })\n                    .sum();\n                let alphabetic_chars: usize = off\n                    .iter()\n                    .map(|item| item.text.chars().filter(|c| c.is_alphabetic()).count())\n                    .sum();\n                let sparse_hidden_phrase = (1..=4).contains(&off.len())\n                    && total_chars >= 24\n                    && sparse_words >= 4\n                    && alphabetic_chars * 2 >= total_chars.max(1);\n                let coherent =\n                    (dense_neighbor_page || sparse_hidden_phrase) && !straddles;\n'''
+          if source.count(old) != 1:
+              raise SystemExit('extractor clipping anchor changed')
+          source = source.replace(old, new, 1)
+          extractor.write_text(source)
+          PY
+          cd /tmp/pdf-candidate
+          cargo fmt --all
+          git diff --check
+
+      - name: Validate candidate
+        run: |
+          set -euo pipefail
+          cd /tmp/pdf-candidate
+          cargo fmt --all -- --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test --all-targets
+
+      - name: Build paired binaries and upstream
+        run: |
+          set -euo pipefail
+          CARGO_TARGET_DIR="$RUNNER_TEMP/baseline-target" cargo build --release --manifest-path /tmp/pdf-baseline/Cargo.toml --bin research-audit
+          CARGO_TARGET_DIR="$RUNNER_TEMP/candidate-target" cargo build --release --manifest-path /tmp/pdf-candidate/Cargo.toml --bin research-audit
+          git clone --depth 1 https://github.com/firecrawl/pdf-inspector.git "$RUNNER_TEMP/upstream"
+          CARGO_TARGET_DIR="$RUNNER_TEMP/upstream-target" cargo build --release --manifest-path "$RUNNER_TEMP/upstream/Cargo.toml" --bin pdf2md
+          echo "BASELINE_BINARY=$RUNNER_TEMP/baseline-target/release/research-audit" >> "$GITHUB_ENV"
+          echo "CANDIDATE_BINARY=$RUNNER_TEMP/candidate-target/release/research-audit" >> "$GITHUB_ENV"
+          echo "UPSTREAM_BINARY=$RUNNER_TEMP/upstream-target/release/pdf2md" >> "$GITHUB_ENV"
+
+      - name: Download identical 100-paper corpus
+        run: |
+          set -euo pipefail
+          python benchmarks/research_fidelity/audit.py select --arxiv 60 --pmc 40 --out "$RUNNER_TEMP/cleanliness-experiment/manifest.json"
+          python benchmarks/research_fidelity/audit.py download --manifest "$RUNNER_TEMP/cleanliness-experiment/manifest.json" --root "$RUNNER_TEMP/cleanliness-experiment/corpus"
+
+      - name: Compare source-grounded fidelity
+        run: |
+          set -euo pipefail
+          python benchmarks/research_fidelity/audit.py evaluate \
+            --manifest "$RUNNER_TEMP/cleanliness-experiment/manifest.json" \
+            --root "$RUNNER_TEMP/cleanliness-experiment/corpus" \
+            --fork-binary "$BASELINE_BINARY" --upstream-binary "$UPSTREAM_BINARY" \
+            --out "$RUNNER_TEMP/cleanliness-experiment/baseline.jsonl"
+          python benchmarks/research_fidelity/audit.py evaluate \
+            --manifest "$RUNNER_TEMP/cleanliness-experiment/manifest.json" \
+            --root "$RUNNER_TEMP/cleanliness-experiment/corpus" \
+            --fork-binary "$CANDIDATE_BINARY" --upstream-binary "$UPSTREAM_BINARY" \
+            --out "$RUNNER_TEMP/cleanliness-experiment/candidate.jsonl"
+          python /tmp/compare_candidate.py quality \
+            --baseline "$RUNNER_TEMP/cleanliness-experiment/baseline.jsonl" \
+            --candidate "$RUNNER_TEMP/cleanliness-experiment/candidate.jsonl" \
+            --out "$RUNNER_TEMP/cleanliness-experiment/report/quality.json"
+
+      - name: Compare paired 200-page latency
+        run: |
+          set -euo pipefail
+          python benchmarks/research_fidelity/audit.py stress \
+            --manifest "$RUNNER_TEMP/cleanliness-experiment/manifest.json" \
+            --root "$RUNNER_TEMP/cleanliness-experiment/corpus" \
+            --fork-binary "$CANDIDATE_BINARY" \
+            --out-dir "$RUNNER_TEMP/cleanliness-experiment/report" \
+            --pages 200 --repeats 1
+          python /tmp/compare_candidate.py latency \
+            --baseline-binary "$BASELINE_BINARY" --candidate-binary "$CANDIDATE_BINARY" \
+            --pdf "$RUNNER_TEMP/cleanliness-experiment/report/research-stress-200p.pdf" \
+            --warmups 2 --rounds 12 --max-ratio 1.01 \
+            --out "$RUNNER_TEMP/cleanliness-experiment/report/latency.json"
+          rm -f "$RUNNER_TEMP/cleanliness-experiment/report/research-stress-200p.pdf"
+
+      - name: Validate WebAssembly
+        run: |
+          set -euo pipefail
+          cd /tmp/pdf-candidate
+          cargo check --target wasm32-unknown-unknown
+          cargo check --manifest-path wasm/Cargo.toml --target wasm32-unknown-unknown
+          cargo clippy --manifest-path wasm/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: research-cleanliness-experiment-${{ github.run_id }}
+          path: ${{ runner.temp }}/cleanliness-experiment/report
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Publish validated production files to main
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$BASE_SHA"
+          git worktree add --detach /tmp/pdf-release origin/main
+          cp /tmp/pdf-candidate/src/markdown/preprocess.rs /tmp/pdf-release/src/markdown/preprocess.rs
+          cp /tmp/pdf-candidate/src/markdown/convert.rs /tmp/pdf-release/src/markdown/convert.rs
+          cp /tmp/pdf-candidate/src/extractor/mod.rs /tmp/pdf-release/src/extractor/mod.rs
+          cd /tmp/pdf-release
+          cargo fmt --all
+          git diff --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- src/markdown/preprocess.rs src/markdown/convert.rs src/extractor/mod.rs
+          git commit -m 'fix: remove hidden and duplicate research text'
+          git push origin HEAD:refs/heads/main

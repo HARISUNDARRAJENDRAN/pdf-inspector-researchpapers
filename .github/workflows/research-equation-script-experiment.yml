@@ -1,0 +1,359 @@
+name: Research equation script experiment
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [opt/research-equation-scripts]
+    paths: ['.github/workflows/research-equation-script-experiment.yml']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  RAYON_NUM_THREADS: '2'
+  MALLOC_ARENA_MAX: '2'
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: benchmarks/research_fidelity/requirements.txt
+
+      - name: Install audit dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pandoc time
+          python -m pip install --upgrade pip
+          python -m pip install -r benchmarks/research_fidelity/requirements.txt
+
+      - name: Prepare baseline and candidate
+        run: |
+          set -euo pipefail
+          git fetch origin main lab/research-fidelity-audit
+          BASE_SHA=$(git rev-parse origin/main)
+          echo "BASE_SHA=$BASE_SHA" >> "$GITHUB_ENV"
+          git worktree add --detach /tmp/pdf-baseline "$BASE_SHA"
+          git worktree add --detach /tmp/pdf-candidate "$BASE_SHA"
+          git show origin/lab/research-fidelity-audit:benchmarks/research_fidelity/compare_candidate.py > /tmp/compare_candidate.py
+          mkdir -p "$RUNNER_TEMP/equation-experiment/report"
+
+      - name: Add geometry-backed subscript and superscript recovery
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('/tmp/pdf-candidate/src/types.rs')
+          source = path.read_text()
+          impl_anchor = 'impl TextLine {\n'
+          helper = r'''impl TextLine {
+    fn line_has_equation_evidence(&self) -> bool {
+        self.items.iter().any(|item| {
+            let font = item.font.to_ascii_lowercase();
+            font.contains("cmmi")
+                || font.contains("cmsy")
+                || font.contains("cmex")
+                || font.contains("math")
+                || font.contains("symbol")
+                || item.text.chars().any(|character| {
+                    matches!(
+                        character,
+                        '=' | '<'
+                            | '>'
+                            | '≤'
+                            | '≥'
+                            | '≈'
+                            | '≠'
+                            | '±'
+                            | '∑'
+                            | '∫'
+                            | '√'
+                            | '∞'
+                            | '∈'
+                            | '∉'
+                    )
+                })
+        })
+    }
+
+    fn equation_script_marker(previous: &TextItem, current: &TextItem) -> Option<char> {
+        if !matches!((&previous.item_type, &current.item_type), (ItemType::Text, ItemType::Text)) {
+            return None;
+        }
+        let larger = previous.font_size.max(current.font_size).max(1.0);
+        let smaller = previous.font_size.min(current.font_size);
+        if current.font_size > previous.font_size * 0.86 || smaller > larger * 0.86 {
+            return None;
+        }
+
+        let horizontal_gap = current.x - (previous.x + previous.width.max(0.0));
+        let vertical_offset = current.y - previous.y;
+        if horizontal_gap < -larger * 0.25
+            || horizontal_gap > larger * 0.55
+            || vertical_offset.abs() < larger * 0.12
+            || vertical_offset.abs() > larger * 1.15
+        {
+            return None;
+        }
+
+        let current_text = current.text.trim();
+        let previous_text = previous.text.trim();
+        if current_text.is_empty()
+            || previous_text.is_empty()
+            || current_text.chars().count() > 8
+            || !current_text
+                .chars()
+                .all(|character| character.is_alphanumeric() || matches!(character, '+' | '-' | '∞'))
+            || !previous_text
+                .chars()
+                .last()
+                .is_some_and(|character| character.is_alphanumeric() || matches!(character, ')' | ']' | '}'))
+        {
+            return None;
+        }
+
+        Some(if vertical_offset > 0.0 { '^' } else { '_' })
+    }
+'''
+          if source.count(impl_anchor) != 1:
+              raise SystemExit('TextLine impl anchor changed')
+          source = source.replace(impl_anchor, helper, 1)
+
+          loop_anchor = '        let single_char_threshold = self.adaptive_threshold;\n\n        let mut result = String::new();\n'
+          loop_replacement = '''        let single_char_threshold = self.adaptive_threshold;\n        let line_has_equation_evidence = self.line_has_equation_evidence();\n\n        let mut result = String::new();\n'''
+          if source.count(loop_anchor) != 1:
+              raise SystemExit('text formatting loop anchor changed')
+          source = source.replace(loop_anchor, loop_replacement, 1)
+
+          spacing_old = r'''            // Determine spacing
+            let needs_space = if i == 0 || result.is_empty() {
+                false
+            } else {
+                let prev_item = &self.items[i - 1];
+                self.needs_space_between(prev_item, item, &result, single_char_threshold)
+            };
+'''
+          spacing_new = r'''            // Determine spacing. A smaller, vertically offset math run
+            // immediately following a base glyph is semantic script content,
+            // not another word. Preserve it as lightweight TeX-like Markdown
+            // (`x_{i}`, `d_{k}`, `n^{2}`) for agents and math-aware consumers.
+            let script_marker = if i == 0 || !line_has_equation_evidence {
+                None
+            } else {
+                Self::equation_script_marker(&self.items[i - 1], item)
+            };
+            let needs_space = if i == 0 || result.is_empty() || script_marker.is_some() {
+                false
+            } else {
+                let prev_item = &self.items[i - 1];
+                self.needs_space_between(prev_item, item, &result, single_char_threshold)
+            };
+'''
+          if source.count(spacing_old) != 1:
+              raise SystemExit('spacing block anchor changed')
+          source = source.replace(spacing_old, spacing_new, 1)
+
+          text_old = '            result.push_str(text_trimmed);\n'
+          text_new = '''            if let Some(marker) = script_marker {\n                result.push(marker);\n                result.push('{');\n                result.push_str(text_trimmed);\n                result.push('}');\n            } else {\n                result.push_str(text_trimmed);\n            }\n'''
+          if source.count(text_old) != 1:
+              raise SystemExit('text emission anchor changed')
+          source = source.replace(text_old, text_new, 1)
+
+          source += r'''
+
+#[cfg(test)]
+mod semantic_equation_script_tests {
+    use super::*;
+
+    fn item(text: &str, x: f32, y: f32, size: f32, font: &str) -> TextItem {
+        TextItem {
+            text: text.to_owned(),
+            x,
+            y,
+            width: text.chars().count() as f32 * size * 0.45,
+            height: size,
+            font: font.to_owned(),
+            font_size: size,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            item_type: ItemType::Text,
+            mcid: None,
+        }
+    }
+
+    fn line(items: Vec<TextItem>) -> TextLine {
+        TextLine {
+            items,
+            y: 500.0,
+            page: 1,
+            adaptive_threshold: 0.1,
+        }
+    }
+
+    #[test]
+    fn emits_semantic_subscript_and_superscript_in_math_lines() {
+        let subscript = line(vec![
+            item("d", 72.0, 500.0, 10.0, "CMMI10"),
+            item("k", 76.5, 497.5, 7.0, "CMMI7"),
+            item(" = ", 81.0, 500.0, 10.0, "CMSY10"),
+            item("8", 96.0, 500.0, 10.0, "CMR10"),
+        ]);
+        assert!(subscript.text_with_formatting(true, true, false).contains("d_{k}"));
+
+        let superscript = line(vec![
+            item("n", 72.0, 500.0, 10.0, "CMMI10"),
+            item("2", 76.5, 503.0, 7.0, "CMR7"),
+            item(" = ", 81.0, 500.0, 10.0, "CMSY10"),
+            item("4", 96.0, 500.0, 10.0, "CMR10"),
+        ]);
+        assert!(superscript.text_with_formatting(true, true, false).contains("n^{2}"));
+    }
+
+    #[test]
+    fn does_not_convert_prose_footnotes_without_math_evidence() {
+        let prose = line(vec![
+            item("Result", 72.0, 500.0, 10.0, "Helvetica"),
+            item("2", 100.0, 503.0, 7.0, "Helvetica"),
+        ]);
+        assert!(!prose.text_with_formatting(true, true, false).contains("^{"));
+    }
+}
+'''
+          path.write_text(source)
+          PY
+          cd /tmp/pdf-candidate
+          cargo fmt --all
+          git diff --check
+
+      - name: Validate candidate
+        run: |
+          set -euo pipefail
+          cd /tmp/pdf-candidate
+          cargo fmt --all -- --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test --all-targets
+
+      - name: Build paired binaries and upstream
+        run: |
+          set -euo pipefail
+          CARGO_TARGET_DIR="$RUNNER_TEMP/baseline-target" cargo build --release --manifest-path /tmp/pdf-baseline/Cargo.toml --bin research-audit
+          CARGO_TARGET_DIR="$RUNNER_TEMP/candidate-target" cargo build --release --manifest-path /tmp/pdf-candidate/Cargo.toml --bin research-audit
+          git clone --depth 1 https://github.com/firecrawl/pdf-inspector.git "$RUNNER_TEMP/upstream"
+          CARGO_TARGET_DIR="$RUNNER_TEMP/upstream-target" cargo build --release --manifest-path "$RUNNER_TEMP/upstream/Cargo.toml" --bin pdf2md
+          echo "BASELINE_BINARY=$RUNNER_TEMP/baseline-target/release/research-audit" >> "$GITHUB_ENV"
+          echo "CANDIDATE_BINARY=$RUNNER_TEMP/candidate-target/release/research-audit" >> "$GITHUB_ENV"
+          echo "UPSTREAM_BINARY=$RUNNER_TEMP/upstream-target/release/pdf2md" >> "$GITHUB_ENV"
+
+      - name: Download identical 100-paper source corpus
+        run: |
+          set -euo pipefail
+          python benchmarks/research_fidelity/audit.py select --arxiv 60 --pmc 40 --out "$RUNNER_TEMP/equation-experiment/manifest.json"
+          python benchmarks/research_fidelity/audit.py download --manifest "$RUNNER_TEMP/equation-experiment/manifest.json" --root "$RUNNER_TEMP/equation-experiment/corpus"
+
+      - name: Compare source-grounded equation fidelity
+        run: |
+          set -euo pipefail
+          python benchmarks/research_fidelity/audit.py evaluate \
+            --manifest "$RUNNER_TEMP/equation-experiment/manifest.json" \
+            --root "$RUNNER_TEMP/equation-experiment/corpus" \
+            --fork-binary "$BASELINE_BINARY" --upstream-binary "$UPSTREAM_BINARY" \
+            --out "$RUNNER_TEMP/equation-experiment/baseline.jsonl"
+          python benchmarks/research_fidelity/audit.py evaluate \
+            --manifest "$RUNNER_TEMP/equation-experiment/manifest.json" \
+            --root "$RUNNER_TEMP/equation-experiment/corpus" \
+            --fork-binary "$CANDIDATE_BINARY" --upstream-binary "$UPSTREAM_BINARY" \
+            --out "$RUNNER_TEMP/equation-experiment/candidate.jsonl"
+          python /tmp/compare_candidate.py quality \
+            --baseline "$RUNNER_TEMP/equation-experiment/baseline.jsonl" \
+            --candidate "$RUNNER_TEMP/equation-experiment/candidate.jsonl" \
+            --out "$RUNNER_TEMP/equation-experiment/report/quality.json"
+
+      - name: Compare paired 200-page latency
+        run: |
+          set -euo pipefail
+          python benchmarks/research_fidelity/audit.py stress \
+            --manifest "$RUNNER_TEMP/equation-experiment/manifest.json" \
+            --root "$RUNNER_TEMP/equation-experiment/corpus" \
+            --fork-binary "$CANDIDATE_BINARY" \
+            --out-dir "$RUNNER_TEMP/equation-experiment/report" --pages 200 --repeats 1
+          python /tmp/compare_candidate.py latency \
+            --baseline-binary "$BASELINE_BINARY" --candidate-binary "$CANDIDATE_BINARY" \
+            --pdf "$RUNNER_TEMP/equation-experiment/report/research-stress-200p.pdf" \
+            --warmups 2 --rounds 12 --max-ratio 1.01 \
+            --out "$RUNNER_TEMP/equation-experiment/report/latency.json"
+          rm -f "$RUNNER_TEMP/equation-experiment/report/research-stress-200p.pdf"
+
+      - name: Validate WebAssembly
+        run: |
+          set -euo pipefail
+          cd /tmp/pdf-candidate
+          cargo check --target wasm32-unknown-unknown
+          cargo check --manifest-path wasm/Cargo.toml --target wasm32-unknown-unknown
+          cargo clippy --manifest-path wasm/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
+
+      - name: Build versioned validation evidence
+        if: success()
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os, pathlib
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'equation-experiment' / 'report'
+          record = {
+              'change': 'geometry-backed semantic equation scripts',
+              'baseline_sha': os.environ['BASE_SHA'],
+              'candidate_branch_sha': os.environ['GITHUB_SHA'],
+              'quality': json.loads((root / 'quality.json').read_text()),
+              'latency': json.loads((root / 'latency.json').read_text()),
+          }
+          (root / 'validated.json').write_text(json.dumps(record, indent=2, sort_keys=True) + '\n')
+          PY
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: equation-script-experiment-${{ github.run_id }}
+          path: ${{ runner.temp }}/equation-experiment/report
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Publish validated parser and evidence to main
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$BASE_SHA"
+          git worktree add --detach /tmp/pdf-release origin/main
+          cp /tmp/pdf-candidate/src/types.rs /tmp/pdf-release/src/types.rs
+          mkdir -p /tmp/pdf-release/benchmarks/research_fidelity/validated
+          cp "$RUNNER_TEMP/equation-experiment/report/validated.json" \
+             /tmp/pdf-release/benchmarks/research_fidelity/validated/equation-script-fidelity.json
+          cd /tmp/pdf-release
+          cargo fmt --all
+          git diff --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- src/types.rs benchmarks/research_fidelity/validated/equation-script-fidelity.json
+          git commit -m 'fix: recover semantic equation scripts'
+          git push origin HEAD:refs/heads/main

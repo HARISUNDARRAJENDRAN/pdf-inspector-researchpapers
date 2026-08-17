@@ -16,7 +16,7 @@ use super::classify::{
 };
 use super::heading::classify_heading_sequences;
 use super::postprocess::clean_markdown;
-use super::preprocess::{merge_drop_caps, merge_heading_lines};
+use super::preprocess::{merge_drop_caps, merge_heading_lines, merge_wrapped_caption_lines};
 use super::{item_is_in_chart_region, MarkdownOptions, CHART_SEPARATOR_PAD};
 
 /// Logical stream geometry for a page where one full-width chart separates
@@ -714,6 +714,12 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
     // threshold and cause every line to be treated as a paragraph break.
     let para_threshold = compute_paragraph_threshold(&lines, base_size);
 
+    // A caption is often emitted as one prefixed line followed by several
+    // unlabelled visual wraps. Join only high-confidence continuations before
+    // heading/paragraph classification so the complete caption remains one
+    // semantic block.
+    let lines = merge_wrapped_caption_lines(lines, base_size, para_threshold);
+
     // Merge wrapped bold headings: a 2-3 line group of consecutive all-bold
     // body-size lines that is isolated as a group (paragraph break before
     // and after) is one heading that wrapped. Left split, the internal line
@@ -1268,6 +1274,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
 
     // Compute the typical line spacing for paragraph break detection
     let para_threshold = compute_paragraph_threshold(&lines, base_size);
+    let lines = merge_wrapped_caption_lines(lines, base_size, para_threshold);
 
     let isolated_lines = find_isolated_lines(&lines, base_size, para_threshold);
     let wrapped_bold_paragraph_lines =

@@ -1,0 +1,377 @@
+name: Promote exact overlay deduplication
+
+on:
+  push:
+    branches: [lab/research-fidelity-audit]
+    paths:
+      - '.github/workflows/promote-exact-overlay-dedup.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RAYON_NUM_THREADS: '2'
+  MALLOC_ARENA_MAX: '2'
+
+concurrency:
+  group: promote-exact-overlay-dedup
+  cancel-in-progress: false
+
+jobs:
+  validate-and-promote:
+    runs-on: ubuntu-latest
+    timeout-minutes: 210
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: benchmarks/research_fidelity/requirements.txt
+
+      - name: Wait for preceding validated parser releases
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 120); do
+            git fetch origin main
+            if git show origin/main:src/markdown/convert.rs | grep -q 'paragraph_continues_across_page'; then
+              echo 'cross-page paragraph release is present on main'
+              exit 0
+            fi
+            echo "waiting for prior parser release ($attempt/120)"
+            sleep 60
+          done
+          exit 1
+
+      - name: Install evaluation dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pandoc
+          python -m pip install --upgrade pip
+          python -m pip install -r benchmarks/research_fidelity/requirements.txt
+
+      - name: Prepare baseline and candidate from current main
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git worktree add --detach /tmp/dedupe-main origin/main
+          git worktree add -b release/exact-overlay-dedup /tmp/dedupe-candidate origin/main
+
+      - name: Apply exact semantic-overlay deduplication
+        working-directory: /tmp/dedupe-candidate
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          preprocess = Path('src/markdown/preprocess.rs')
+          source = preprocess.read_text()
+          source = source.replace(
+              'use crate::types::{TextItem, TextLine};',
+              'use crate::types::{ItemType, TextItem, TextLine};',
+              1,
+          )
+          anchor = '/// Resolve a heading level for a line, considering both struct-tree roles and font heuristics.\n'
+          addition = r'''#[derive(Hash, PartialEq, Eq)]
+struct ExactOverlayKey<'a> {
+    text: &'a str,
+    font: &'a str,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    font_size: u32,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    strikeout: bool,
+    mcid: Option<i64>,
+}
+
+/// Remove only exact duplicate text paint operations from semantic Markdown.
+///
+/// Some producers simulate heavier glyphs by painting an identical run twice
+/// at the same coordinates. The raw positioned-text API remains lossless; this
+/// pass is deliberately limited to the Markdown line stream. Keys borrow text
+/// and font names, avoiding per-item string clones.
+pub(crate) fn deduplicate_exact_overlay_items(mut lines: Vec<TextLine>) -> Vec<TextLine> {
+    for line in &mut lines {
+        if line.items.len() < 2 {
+            continue;
+        }
+        let keep = {
+            let mut seen: HashSet<ExactOverlayKey<'_>> =
+                HashSet::with_capacity(line.items.len());
+            line.items
+                .iter()
+                .map(|item| {
+                    if !matches!(&item.item_type, ItemType::Text) {
+                        return true;
+                    }
+                    seen.insert(ExactOverlayKey {
+                        text: &item.text,
+                        font: &item.font,
+                        x: item.x.to_bits(),
+                        y: item.y.to_bits(),
+                        width: item.width.to_bits(),
+                        height: item.height.to_bits(),
+                        font_size: item.font_size.to_bits(),
+                        bold: item.is_bold,
+                        italic: item.is_italic,
+                        underline: item.is_underline,
+                        strikeout: item.is_strikeout,
+                        mcid: item.mcid,
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut index = 0usize;
+        line.items.retain(|_| {
+            let retain = keep[index];
+            index += 1;
+            retain
+        });
+    }
+    lines.retain(|line| !line.items.is_empty());
+    lines
+}
+
+'''
+          if anchor not in source:
+              raise SystemExit('preprocess insertion anchor missing')
+          source = source.replace(anchor, addition + anchor, 1)
+          test_anchor = '#[cfg(test)]\nmod tests {\n'
+          tests = r'''    #[test]
+    fn removes_only_exact_duplicate_text_paints() {
+        let make = |x: f32, mcid| TextItem {
+            text: "Research fidelity".into(),
+            x,
+            y: 700.0,
+            width: 80.0,
+            height: 12.0,
+            font: "Body".into(),
+            font_size: 12.0,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            item_type: ItemType::Text,
+            mcid,
+        };
+        let line = TextLine {
+            items: vec![make(72.0, None), make(72.0, None), make(172.0, None)],
+            y: 700.0,
+            page: 1,
+            adaptive_threshold: 0.1,
+        };
+        let result = deduplicate_exact_overlay_items(vec![line]);
+        assert_eq!(result[0].items.len(), 2);
+        assert_eq!(result[0].items[0].x, 72.0);
+        assert_eq!(result[0].items[1].x, 172.0);
+    }
+
+    #[test]
+    fn preserves_coincident_text_with_distinct_mcid() {
+        let make = |mcid| TextItem {
+            text: "Tagged text".into(),
+            x: 72.0,
+            y: 700.0,
+            width: 60.0,
+            height: 12.0,
+            font: "Body".into(),
+            font_size: 12.0,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            item_type: ItemType::Text,
+            mcid: Some(mcid),
+        };
+        let line = TextLine {
+            items: vec![make(1), make(2)],
+            y: 700.0,
+            page: 1,
+            adaptive_threshold: 0.1,
+        };
+        assert_eq!(deduplicate_exact_overlay_items(vec![line])[0].items.len(), 2);
+    }
+
+'''
+          if test_anchor not in source:
+              raise SystemExit('preprocess tests anchor missing')
+          source = source.replace(test_anchor, test_anchor + tests, 1)
+          preprocess.write_text(source)
+
+          convert = Path('src/markdown/convert.rs')
+          source = convert.read_text()
+          import_marker = 'use super::preprocess::{\n'
+          import_start = source.find(import_marker)
+          if import_start < 0:
+              raise SystemExit('preprocess import missing')
+          import_end = source.find('};', import_start)
+          if import_end < 0:
+              raise SystemExit('preprocess import end missing')
+          import_block = source[import_start:import_end + 2]
+          if 'deduplicate_exact_overlay_items' not in import_block:
+              body = import_block[len(import_marker):-2]
+              body = '    deduplicate_exact_overlay_items,\n' + body
+              source = source[:import_start] + import_marker + body + '};' + source[import_end + 2:]
+
+          anchor = '    // Calculate font statistics\n    let font_stats = calculate_font_stats(&lines);\n'
+          if source.count(anchor) != 2:
+              raise SystemExit(f'expected two font-stat anchors, found {source.count(anchor)}')
+          source = source.replace(
+              anchor,
+              '    let lines = deduplicate_exact_overlay_items(lines);\n'
+              '    if lines.is_empty() {\n'
+              '        return String::new();\n'
+              '    }\n\n' + anchor,
+          )
+          convert.write_text(source)
+          PY
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo clippy -- -D warnings
+          cargo test
+
+      - name: Build both release parsers
+        run: |
+          CARGO_TARGET_DIR=/tmp/dedupe-target-main cargo build --release --manifest-path /tmp/dedupe-main/Cargo.toml --bin research-audit --bin pdf2md
+          CARGO_TARGET_DIR=/tmp/dedupe-target-candidate cargo build --release --manifest-path /tmp/dedupe-candidate/Cargo.toml --bin research-audit --bin pdf2md
+
+      - name: Select and download shared 100-paper corpus
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/dedupe-corpus
+          python /tmp/dedupe-candidate/benchmarks/research_fidelity/audit.py select --arxiv 60 --pmc 40 --out /tmp/dedupe-manifest.json
+          python /tmp/dedupe-candidate/benchmarks/research_fidelity/audit.py download --manifest /tmp/dedupe-manifest.json --root /tmp/dedupe-corpus
+
+      - name: Evaluate baseline and candidate
+        run: |
+          set -euo pipefail
+          python /tmp/dedupe-candidate/benchmarks/research_fidelity/audit.py evaluate --manifest /tmp/dedupe-manifest.json --root /tmp/dedupe-corpus --fork-binary /tmp/dedupe-target-main/release/research-audit --upstream-binary /tmp/dedupe-target-main/release/pdf2md --out /tmp/dedupe-main.jsonl
+          python /tmp/dedupe-candidate/benchmarks/research_fidelity/audit.py evaluate --manifest /tmp/dedupe-manifest.json --root /tmp/dedupe-corpus --fork-binary /tmp/dedupe-target-candidate/release/research-audit --upstream-binary /tmp/dedupe-target-candidate/release/pdf2md --out /tmp/dedupe-candidate.jsonl
+
+      - name: Gate redundancy fidelity
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, math, statistics
+          from pathlib import Path
+          names = ('overall_score','word_precision','word_f1','bigram_f1','sequence_similarity','paragraph_f1','heading_f1','caption_f1','table_score','equation_score','tail_recall','cleanliness','local_duplicate_rate')
+          def walk(value,path=()):
+              if isinstance(value,dict):
+                  metrics=value.get('metrics') if isinstance(value.get('metrics'),dict) else value
+                  if isinstance(metrics,dict) and isinstance(metrics.get('overall_score'),(int,float)):
+                      label='/'.join(map(str,path))
+                      for key in ('implementation','name','mode','variant','parser'):
+                          if value.get(key) is not None: label+='/'+str(value[key])
+                      yield label.casefold(),metrics
+                  for key,child in value.items(): yield from walk(child,(*path,key))
+              elif isinstance(value,list):
+                  for index,child in enumerate(value): yield from walk(child,(*path,index))
+          def rows(path):
+              out=[]
+              for raw in Path(path).read_text().splitlines():
+                  if not raw.strip(): continue
+                  candidates=[(label,m) for label,m in walk(json.loads(raw)) if 'research' in label and 'upstream' not in label]
+                  if not candidates: continue
+                  candidates.sort(key=lambda pair:('fast' in pair[0],-len(pair[0])),reverse=True)
+                  m=candidates[0][1]
+                  if all(isinstance(m.get(n),(int,float)) and math.isfinite(float(m[n])) for n in names): out.append(m)
+              if len(out)<90: raise RuntimeError(f'only {len(out)} valid rows')
+              return out
+          base=rows('/tmp/dedupe-main.jsonl'); cand=rows('/tmp/dedupe-candidate.jsonl')
+          means=lambda rs:{n:statistics.fmean(float(r[n]) for r in rs) for n in names}
+          bm,cm=means(base),means(cand)
+          for n in names: print(f'{n}: main={bm[n]:.8f} candidate={cm[n]:.8f} delta={cm[n]-bm[n]:+.8f}')
+          improved=sum(1 for b,c in zip(base,cand) if float(c['local_duplicate_rate'])+1e-12<float(b['local_duplicate_rate']) or float(c['word_precision'])>float(b['word_precision'])+1e-6)
+          print('papers with reduced redundancy or higher precision:',improved)
+          if cm['overall_score']+0.00005<bm['overall_score']: raise RuntimeError('overall fidelity regressed')
+          if cm['word_precision']+cm['cleanliness']<bm['word_precision']+bm['cleanliness']+0.00001: raise RuntimeError('precision/cleanliness did not improve')
+          if improved<1: raise RuntimeError('no corpus paper benefited from exact-overlay deduplication')
+          for n in ('word_f1','bigram_f1','sequence_similarity','paragraph_f1','heading_f1','caption_f1','table_score','equation_score','tail_recall'):
+              if cm[n]+0.00050<bm[n]: raise RuntimeError(f'protected metric regressed: {n}')
+          Path('/tmp/dedupe-fidelity.json').write_text(json.dumps({'papers':len(base),'improved_papers':improved,'main':bm,'candidate':cm,'delta':{n:cm[n]-bm[n] for n in names}},indent=2)+'\n')
+          PY
+
+      - name: Gate paired latency
+        run: |
+          set -euo pipefail
+          for dir in /tmp/dedupe-main /tmp/dedupe-candidate; do
+            cat > "$dir/src/bin/dedupe_latency.rs" <<'RS'
+          use pdf_inspector::process_research_pdf;
+          use std::{env,time::Instant};
+          fn main(){let paths:Vec<String>=env::args().skip(1).collect();let start=Instant::now();let mut bytes=0usize;for path in paths{bytes+=process_research_pdf(&path).unwrap().markdown.unwrap().len();}println!("{} {}",start.elapsed().as_nanos(),bytes);}
+          RS
+            cat >> "$dir/Cargo.toml" <<'TOML'
+
+          [[bin]]
+          name = "dedupe-latency"
+          path = "src/bin/dedupe_latency.rs"
+          TOML
+          done
+          CARGO_TARGET_DIR=/tmp/dedupe-latency-main cargo build --release --manifest-path /tmp/dedupe-main/Cargo.toml --bin dedupe-latency
+          CARGO_TARGET_DIR=/tmp/dedupe-latency-candidate cargo build --release --manifest-path /tmp/dedupe-candidate/Cargo.toml --bin dedupe-latency
+          python - <<'PY'
+          import json,os,statistics,subprocess
+          from pathlib import Path
+          manifest=json.loads(Path('/tmp/dedupe-manifest.json').read_text());root=Path('/tmp/dedupe-corpus');papers=[]
+          for item in manifest['papers']:
+              if item.get('download_status')=='ok' and item.get('provider')=='arxiv':
+                  p=root/item['pdf_path']
+                  if p.exists(): papers.append(str(p))
+              if len(papers)==5: break
+          bins={'main':'/tmp/dedupe-latency-main/release/dedupe-latency','candidate':'/tmp/dedupe-latency-candidate/release/dedupe-latency'}
+          def run(label):
+              out=subprocess.check_output([bins[label],*papers],text=True,env=os.environ).split();assert int(out[1])>0;return int(out[0])
+          for _ in range(3):run('main');run('candidate')
+          samples={'main':[],'candidate':[]}
+          for i in range(24):
+              for label in (('main','candidate') if i%2==0 else ('candidate','main')):samples[label].append(run(label))
+          bm=statistics.median(samples['main']);cm=statistics.median(samples['candidate']);delta=(cm-bm)/bm
+          print(f'median main={bm/1e6:.3f}ms candidate={cm/1e6:.3f}ms delta={delta*100:+.3f}%')
+          if cm>bm*1.01:raise RuntimeError('latency regressed by more than 1%')
+          Path('/tmp/dedupe-latency.json').write_text(json.dumps({'main_median_ms':bm/1e6,'candidate_median_ms':cm/1e6,'delta_percent':delta*100,'samples_ms':{k:[x/1e6 for x in v] for k,v in samples.items()}},indent=2)+'\n')
+          PY
+
+      - name: Push clean validated change to main
+        working-directory: /tmp/dedupe-candidate
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo clippy -- -D warnings
+          cargo test
+          mapfile -t changed < <(git diff --name-only)
+          expected=(src/markdown/convert.rs src/markdown/preprocess.rs)
+          if [[ "${changed[*]}" != "${expected[*]}" ]]; then printf 'unexpected diff: %s\n' "${changed[*]}" >&2; exit 1; fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- src/markdown/convert.rs src/markdown/preprocess.rs
+          git commit -m 'fix: remove exact duplicate text overlays from markdown'
+          git push origin HEAD:main
+          git rev-parse HEAD > /tmp/dedupe-promoted-sha.txt
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: exact-overlay-promotion-${{ github.run_id }}
+          path: |
+            /tmp/dedupe-fidelity.json
+            /tmp/dedupe-latency.json
+            /tmp/dedupe-promoted-sha.txt
+          if-no-files-found: warn
+          retention-days: 30

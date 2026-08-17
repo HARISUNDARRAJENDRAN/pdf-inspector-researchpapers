@@ -1,0 +1,235 @@
+name: Evaluate and promote table-fidelity fixes
+
+on:
+  push:
+    branches: [lab/research-fidelity-audit]
+    paths:
+      - '.github/workflows/evaluate-upstream-table-fidelity.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  CARGO_TERM_COLOR: always
+  RAYON_NUM_THREADS: '2'
+  MALLOC_ARENA_MAX: '2'
+
+concurrency:
+  group: promote-table-fidelity
+  cancel-in-progress: false
+
+jobs:
+  evaluate-and-promote:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: benchmarks/research_fidelity/requirements.txt
+
+      - name: Wait until earlier promotion workflows are no longer running
+        run: |
+          set -euo pipefail
+          workflows=(promote-caption-fidelity.yml promote-cross-page-paragraph.yml promote-exact-overlay-dedup.yml)
+          for attempt in $(seq 1 180); do
+            active=0
+            for workflow in "${workflows[@]}"; do
+              count=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow/runs?per_page=10" --jq '[.workflow_runs[] | select(.status == "queued" or .status == "in_progress")] | length' 2>/dev/null || echo 0)
+              active=$((active + count))
+            done
+            if [[ "$active" -eq 0 ]]; then
+              exit 0
+            fi
+            echo "waiting for $active earlier promotion run(s) ($attempt/180)"
+            sleep 60
+          done
+          exit 1
+
+      - name: Install evaluation dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pandoc
+          python -m pip install --upgrade pip
+          python -m pip install -r benchmarks/research_fidelity/requirements.txt
+
+      - name: Prepare current main and table candidate
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git worktree add --detach /tmp/table-main origin/main
+          git worktree add -b release/table-fidelity /tmp/table-candidate origin/main
+          git -C /tmp/table-candidate remote add firecrawl https://github.com/firecrawl/pdf-inspector.git
+          git -C /tmp/table-candidate fetch --no-tags firecrawl main
+
+      - name: Port only recent upstream table-fidelity commits
+        working-directory: /tmp/table-candidate
+        run: |
+          set -euo pipefail
+          patterns=(
+            'attach table scripts by body glyph baseline'
+            'attach multi-style table scripts geometrically'
+            'preserve trailing table-script attachments'
+            'ignore repeated page furniture before heuristic table detection'
+          )
+          : > /tmp/table-commits.txt
+          for pattern in "${patterns[@]}"; do
+            sha=$(git log firecrawl/main --regexp-ignore-case --grep="$pattern" --format='%H' -1)
+            if [[ -n "$sha" ]] && ! git merge-base --is-ancestor "$sha" HEAD; then
+              echo "$sha" >> /tmp/table-commits.txt
+            fi
+          done
+          sort -u /tmp/table-commits.txt -o /tmp/table-commits.txt
+          if [[ ! -s /tmp/table-commits.txt ]]; then
+            echo 'No unapplied upstream table-fidelity commits were found.' >&2
+            exit 1
+          fi
+          # Reorder selected commits according to their actual upstream history.
+          git rev-list --reverse firecrawl/main | grep -Fxf /tmp/table-commits.txt > /tmp/table-commits-ordered.txt
+          while read -r sha; do
+            echo "cherry-picking $sha $(git show -s --format=%s "$sha")"
+            git cherry-pick -x "$sha"
+          done < /tmp/table-commits-ordered.txt
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo clippy -- -D warnings
+          cargo test
+          git diff origin/main...HEAD --check
+
+      - name: Build baseline and candidate
+        run: |
+          CARGO_TARGET_DIR=/tmp/table-target-main cargo build --release --manifest-path /tmp/table-main/Cargo.toml --bin research-audit --bin pdf2md
+          CARGO_TARGET_DIR=/tmp/table-target-candidate cargo build --release --manifest-path /tmp/table-candidate/Cargo.toml --bin research-audit --bin pdf2md
+
+      - name: Download one shared 100-paper corpus
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/table-corpus
+          python /tmp/table-candidate/benchmarks/research_fidelity/audit.py select --arxiv 60 --pmc 40 --out /tmp/table-manifest.json
+          python /tmp/table-candidate/benchmarks/research_fidelity/audit.py download --manifest /tmp/table-manifest.json --root /tmp/table-corpus
+
+      - name: Evaluate baseline and candidate
+        run: |
+          set -euo pipefail
+          python /tmp/table-candidate/benchmarks/research_fidelity/audit.py evaluate --manifest /tmp/table-manifest.json --root /tmp/table-corpus --fork-binary /tmp/table-target-main/release/research-audit --upstream-binary /tmp/table-target-main/release/pdf2md --out /tmp/table-main.jsonl
+          python /tmp/table-candidate/benchmarks/research_fidelity/audit.py evaluate --manifest /tmp/table-manifest.json --root /tmp/table-corpus --fork-binary /tmp/table-target-candidate/release/research-audit --upstream-binary /tmp/table-target-candidate/release/pdf2md --out /tmp/table-candidate.jsonl
+
+      - name: Gate table fidelity
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json,math,statistics
+          from pathlib import Path
+          names=('overall_score','word_precision','word_f1','bigram_f1','sequence_similarity','paragraph_f1','heading_f1','caption_f1','table_score','equation_score','tail_recall','cleanliness')
+          def walk(v,p=()):
+              if isinstance(v,dict):
+                  m=v.get('metrics') if isinstance(v.get('metrics'),dict) else v
+                  if isinstance(m,dict) and isinstance(m.get('overall_score'),(int,float)):
+                      label='/'.join(map(str,p))
+                      for k in ('implementation','name','mode','variant','parser'):
+                          if v.get(k) is not None:label+='/'+str(v[k])
+                      yield label.casefold(),m
+                  for k,c in v.items():yield from walk(c,(*p,k))
+              elif isinstance(v,list):
+                  for i,c in enumerate(v):yield from walk(c,(*p,i))
+          def rows(path):
+              out=[]
+              for raw in Path(path).read_text().splitlines():
+                  if not raw.strip():continue
+                  candidates=[(l,m) for l,m in walk(json.loads(raw)) if 'research' in l and 'upstream' not in l]
+                  if not candidates:continue
+                  candidates.sort(key=lambda pair:('fast' in pair[0],-len(pair[0])),reverse=True);m=candidates[0][1]
+                  if all(isinstance(m.get(n),(int,float)) and math.isfinite(float(m[n])) for n in names):out.append(m)
+              if len(out)<90:raise RuntimeError(f'only {len(out)} valid rows')
+              return out
+          base=rows('/tmp/table-main.jsonl');cand=rows('/tmp/table-candidate.jsonl');mean=lambda rs:{n:statistics.fmean(float(r[n]) for r in rs) for n in names};bm,cm=mean(base),mean(cand)
+          for n in names:print(f'{n}: main={bm[n]:.8f} candidate={cm[n]:.8f} delta={cm[n]-bm[n]:+.8f}')
+          improved=sum(1 for b,c in zip(base,cand) if float(c['table_score'])>float(b['table_score'])+1e-6)
+          regressed=sum(1 for b,c in zip(base,cand) if float(c['table_score'])+1e-6<float(b['table_score']))
+          print(f'table-improved papers={improved}, table-regressed papers={regressed}')
+          if cm['overall_score']<bm['overall_score']+0.00005:raise RuntimeError('overall fidelity did not improve')
+          if cm['table_score']<bm['table_score']+0.00020:raise RuntimeError('mean table fidelity did not materially improve')
+          if improved<=regressed:raise RuntimeError('table fixes do not benefit more papers than they regress')
+          for n in ('word_precision','word_f1','bigram_f1','sequence_similarity','paragraph_f1','heading_f1','caption_f1','equation_score','tail_recall','cleanliness'):
+              if cm[n]+0.00075<bm[n]:raise RuntimeError(f'protected metric regressed: {n}')
+          Path('/tmp/table-fidelity.json').write_text(json.dumps({'papers':len(base),'improved_papers':improved,'regressed_papers':regressed,'main':bm,'candidate':cm,'delta':{n:cm[n]-bm[n] for n in names}},indent=2)+'\n')
+          PY
+
+      - name: Gate paired latency
+        run: |
+          set -euo pipefail
+          for dir in /tmp/table-main /tmp/table-candidate; do
+            cat > "$dir/src/bin/table_latency.rs" <<'RS'
+          use pdf_inspector::process_research_pdf;
+          use std::{env,time::Instant};
+          fn main(){let paths:Vec<String>=env::args().skip(1).collect();let start=Instant::now();let mut bytes=0usize;for path in paths{bytes+=process_research_pdf(&path).unwrap().markdown.unwrap().len();}println!("{} {}",start.elapsed().as_nanos(),bytes);}
+          RS
+            cat >> "$dir/Cargo.toml" <<'TOML'
+
+          [[bin]]
+          name = "table-latency"
+          path = "src/bin/table_latency.rs"
+          TOML
+          done
+          CARGO_TARGET_DIR=/tmp/table-latency-main cargo build --release --manifest-path /tmp/table-main/Cargo.toml --bin table-latency
+          CARGO_TARGET_DIR=/tmp/table-latency-candidate cargo build --release --manifest-path /tmp/table-candidate/Cargo.toml --bin table-latency
+          python - <<'PY'
+          import json,os,statistics,subprocess
+          from pathlib import Path
+          manifest=json.loads(Path('/tmp/table-manifest.json').read_text());root=Path('/tmp/table-corpus');papers=[]
+          for item in manifest['papers']:
+              if item.get('download_status')=='ok' and item.get('provider')=='arxiv':
+                  p=root/item['pdf_path']
+                  if p.exists():papers.append(str(p))
+              if len(papers)==5:break
+          bins={'main':'/tmp/table-latency-main/release/table-latency','candidate':'/tmp/table-latency-candidate/release/table-latency'}
+          def run(label):out=subprocess.check_output([bins[label],*papers],text=True,env=os.environ).split();assert int(out[1])>0;return int(out[0])
+          for _ in range(3):run('main');run('candidate')
+          samples={'main':[],'candidate':[]}
+          for i in range(24):
+              for label in (('main','candidate') if i%2==0 else ('candidate','main')):samples[label].append(run(label))
+          bm=statistics.median(samples['main']);cm=statistics.median(samples['candidate']);delta=(cm-bm)/bm
+          print(f'median main={bm/1e6:.3f}ms candidate={cm/1e6:.3f}ms delta={delta*100:+.3f}%')
+          if cm>bm*1.01:raise RuntimeError('latency regressed by more than 1%')
+          Path('/tmp/table-latency.json').write_text(json.dumps({'main_median_ms':bm/1e6,'candidate_median_ms':cm/1e6,'delta_percent':delta*100},indent=2)+'\n')
+          PY
+
+      - name: Push validated table commits to main
+        working-directory: /tmp/table-candidate
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          if [[ "$(git rev-parse origin/main)" != "$(git merge-base origin/main HEAD)" ]]; then
+            git rebase origin/main
+          fi
+          cargo fmt --all -- --check
+          cargo clippy -- -D warnings
+          cargo test
+          git push origin HEAD:main
+          git rev-parse HEAD > /tmp/table-promoted-sha.txt
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: table-fidelity-promotion-${{ github.run_id }}
+          path: |
+            /tmp/table-fidelity.json
+            /tmp/table-latency.json
+            /tmp/table-promoted-sha.txt
+            /tmp/table-commits-ordered.txt
+          if-no-files-found: warn
+          retention-days: 30

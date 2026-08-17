@@ -1,0 +1,383 @@
+name: Research paragraph continuity experiment
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [opt/research-paragraph-fidelity]
+    paths: ['.github/workflows/research-paragraph-experiment.yml']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  RAYON_NUM_THREADS: '2'
+  MALLOC_ARENA_MAX: '2'
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: benchmarks/research_fidelity/requirements.txt
+
+      - name: Install audit dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pandoc time
+          python -m pip install --upgrade pip
+          python -m pip install -r benchmarks/research_fidelity/requirements.txt
+
+      - name: Prepare baseline and candidate worktrees
+        run: |
+          set -euo pipefail
+          git fetch origin main lab/research-fidelity-audit
+          BASE_SHA=$(git rev-parse origin/main)
+          echo "BASE_SHA=$BASE_SHA" >> "$GITHUB_ENV"
+          git worktree add --detach /tmp/pdf-baseline "$BASE_SHA"
+          git worktree add --detach /tmp/pdf-candidate "$BASE_SHA"
+          git show origin/lab/research-fidelity-audit:benchmarks/research_fidelity/compare_candidate.py > /tmp/compare_candidate.py
+          mkdir -p "$RUNNER_TEMP/paragraph-experiment/report"
+
+      - name: Apply conservative cross-page paragraph heuristic
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          analysis = Path('/tmp/pdf-candidate/src/markdown/analysis.rs')
+          source = analysis.read_text()
+          import_anchor = 'use log::debug;\n'
+          import_insert = '''use log::debug;\n\nuse super::classify::{\n    is_caption_line, is_list_item, is_monospace_font, starts_with_bullet_marker,\n};\n'''
+          if source.count(import_anchor) != 1:
+              raise SystemExit('analysis import anchor changed')
+          source = source.replace(import_anchor, import_insert, 1)
+
+          helper_anchor = '/// Determine the heading level for a bold-only line that didn\'t meet the font-size\n'
+          helper = r'''/// Decide whether the first prose line of a page continues the final
+/// prose line of the preceding page.
+///
+/// Page boundaries are serialization artifacts, not semantic paragraph
+/// boundaries.  Research papers often split one justified paragraph across
+/// two pages, but the old converter always emitted a blank line there.  This
+/// predicate requires several independent continuation signals so headings,
+/// captions, lists, equations, and code never get silently joined.
+pub(crate) fn lines_continue_across_page(
+    previous: &TextLine,
+    next: &TextLine,
+    base_size: f32,
+) -> bool {
+    if previous.page.checked_add(1) != Some(next.page)
+        || previous.items.is_empty()
+        || next.items.is_empty()
+    {
+        return false;
+    }
+
+    let previous_text = previous.text();
+    let next_text = next.text();
+    let previous_trimmed = previous_text.trim();
+    let next_trimmed = next_text.trim();
+    if previous_trimmed.split_whitespace().count() < 3
+        || next_trimmed.split_whitespace().count() < 3
+        || is_caption_line(previous_trimmed)
+        || is_caption_line(next_trimmed)
+        || is_list_item(previous_trimmed)
+        || is_list_item(next_trimmed)
+        || starts_with_bullet_marker(next_trimmed)
+        || is_heading_fragment(previous_trimmed)
+        || is_heading_fragment(next_trimmed)
+        || line_is_mostly_bold(previous)
+        || line_is_mostly_bold(next)
+        || previous
+            .items
+            .iter()
+            .chain(next.items.iter())
+            .any(|item| is_monospace_font(&item.font))
+    {
+        return false;
+    }
+
+    let previous_item = &previous.items[0];
+    let next_item = &next.items[0];
+    let size_tolerance = base_size.max(1.0) * 0.08;
+    if (previous_item.font_size - next_item.font_size).abs() > size_tolerance.max(0.6)
+        || (previous_item.x - next_item.x).abs() > base_size.max(10.0) * 4.0
+    {
+        return false;
+    }
+
+    // A lowercase lexical continuation is the strongest language-independent
+    // signal available in positioned text.  It excludes ordinary section
+    // starts while preserving a split word or clause.  Scripts without case
+    // simply fall back to the existing conservative page break.
+    let next_starts_lowercase = next_trimmed
+        .chars()
+        .find(|character| character.is_alphabetic())
+        .is_some_and(char::is_lowercase);
+    if !next_starts_lowercase {
+        return false;
+    }
+
+    // Completed sentences and colon-led displays are real block boundaries.
+    // A trailing line-break hyphen is explicit continuation evidence.
+    if previous_trimmed.ends_with('-') {
+        return true;
+    }
+    !previous_trimmed.ends_with(['.', '!', '?', ':'])
+}
+
+'''
+          if source.count(helper_anchor) != 1:
+              raise SystemExit('analysis helper anchor changed')
+          source = source.replace(helper_anchor, helper + helper_anchor, 1)
+
+          tests = r'''
+
+#[cfg(test)]
+mod cross_page_continuation_tests {
+    use super::*;
+    use crate::types::{ItemType, TextItem};
+
+    fn line(text: &str, page: u32, x: f32, size: f32, bold: bool) -> TextLine {
+        TextLine {
+            items: vec![TextItem {
+                text: text.to_owned(),
+                x,
+                y: if page == 1 { 72.0 } else { 720.0 },
+                width: text.chars().count() as f32 * size * 0.45,
+                height: size,
+                font: "ResearchBody".to_owned(),
+                font_size: size,
+                page,
+                is_bold: bold,
+                is_italic: false,
+                is_underline: false,
+                is_strikeout: false,
+                item_type: ItemType::Text,
+                mcid: None,
+            }],
+            y: if page == 1 { 72.0 } else { 720.0 },
+            page,
+            adaptive_threshold: 0.1,
+        }
+    }
+
+    #[test]
+    fn joins_lowercase_clause_over_page_boundary() {
+        let previous = line(
+            "The proposed architecture remains stable while the controller",
+            1,
+            72.0,
+            10.0,
+            false,
+        );
+        let next = line(
+            "updates its policy from the newly observed channel state.",
+            2,
+            72.0,
+            10.0,
+            false,
+        );
+        assert!(lines_continue_across_page(&previous, &next, 10.0));
+    }
+
+    #[test]
+    fn preserves_real_page_boundary_after_sentence() {
+        let previous = line(
+            "The experiment finishes with a stable prediction.",
+            1,
+            72.0,
+            10.0,
+            false,
+        );
+        let next = line(
+            "the next section begins with a deliberately lowercase label.",
+            2,
+            72.0,
+            10.0,
+            false,
+        );
+        assert!(!lines_continue_across_page(&previous, &next, 10.0));
+    }
+
+    #[test]
+    fn rejects_caption_list_heading_and_style_transitions() {
+        let prose = line(
+            "The model produces the following comparison",
+            1,
+            72.0,
+            10.0,
+            false,
+        );
+        assert!(!lines_continue_across_page(
+            &prose,
+            &line("Figure 2. measured latency across devices", 2, 72.0, 10.0, false),
+            10.0,
+        ));
+        assert!(!lines_continue_across_page(
+            &prose,
+            &line("- measured latency across devices", 2, 72.0, 10.0, false),
+            10.0,
+        ));
+        assert!(!lines_continue_across_page(
+            &prose,
+            &line("Results and Discussion", 2, 72.0, 10.0, true),
+            10.0,
+        ));
+    }
+}
+'''
+          source += tests
+          analysis.write_text(source)
+
+          convert = Path('/tmp/pdf-candidate/src/markdown/convert.rs')
+          source = convert.read_text()
+          old_import = '''    detect_header_level, font_size_rarity, has_dot_leaders, is_heading_fragment, is_toc_entry_line,\n    is_toc_marker_heading,\n'''
+          new_import = '''    detect_header_level, font_size_rarity, has_dot_leaders, is_heading_fragment,\n    is_toc_entry_line, is_toc_marker_heading, lines_continue_across_page,\n'''
+          if source.count(old_import) != 1:
+              raise SystemExit('convert import anchor changed')
+          source = source.replace(old_import, new_import, 1)
+
+          first_old = '''    for (line_idx, line) in lines.iter().enumerate() {\n        // Page break\n        if line.page != current_page {\n            // Flush current page's remaining tables and images\n            if current_page > 0 {\n                if in_code_block {\n                    output.push_str("```\\n");\n                    in_code_block = false;\n                }\n                flush_page_tables_and_images(\n                    current_page,\n                    &page_blocks,\n                    &mut inserted_tables,\n                    &mut inserted_images,\n                    &mut output,\n                    &mut in_paragraph,\n                );\n                if in_paragraph {\n                    output.push_str("\\n\\n");\n                    in_paragraph = false;\n                }\n                output.push_str("\\n\\n");\n            }\n'''
+          first_new = '''    for (line_idx, line) in lines.iter().enumerate() {\n        let previous_page_has_blocks = current_page > 0\n            && page_blocks\n                .get(&current_page)\n                .is_some_and(|blocks| !blocks.is_empty());\n        let continues_previous_page = line.page != current_page\n            && current_page > 0\n            && !options.include_page_numbers\n            && !previous_page_has_blocks\n            && line_idx > 0\n            && lines_continue_across_page(&lines[line_idx - 1], line, base_size);\n\n        // Page break\n        if line.page != current_page {\n            // Flush current page's remaining tables and images. A page edge\n            // does not itself end a paragraph when both lexical and geometric\n            // evidence identify one continuous research-paper paragraph.\n            if current_page > 0 {\n                if in_code_block {\n                    output.push_str("```\\n");\n                    in_code_block = false;\n                }\n                flush_page_tables_and_images(\n                    current_page,\n                    &page_blocks,\n                    &mut inserted_tables,\n                    &mut inserted_images,\n                    &mut output,\n                    &mut in_paragraph,\n                );\n                if in_paragraph && !continues_previous_page {\n                    output.push_str("\\n\\n");\n                    in_paragraph = false;\n                }\n                if !continues_previous_page {\n                    output.push_str("\\n\\n");\n                }\n            }\n'''
+          if source.count(first_old) != 1:
+              raise SystemExit('first page-break anchor changed')
+          source = source.replace(first_old, first_new, 1)
+
+          first_reset_old = '''            current_page = line.page;\n            prev_y = f32::MAX;\n            prev_x = 0.0;\n'''
+          first_reset_new = '''            current_page = line.page;\n            prev_y = if continues_previous_page { line.y } else { f32::MAX };\n            prev_x = if continues_previous_page {\n                line.items.first().map(|item| item.x).unwrap_or(0.0)\n            } else {\n                0.0\n            };\n'''
+          if source.count(first_reset_old) != 1:
+              raise SystemExit('first page reset anchor changed')
+          source = source.replace(first_reset_old, first_reset_new, 1)
+
+          para_old = '        let is_para_break = y_gap.abs() > para_threshold;\n'
+          para_new = '        let is_para_break = !continues_previous_page && y_gap.abs() > para_threshold;\n'
+          if source.count(para_old) != 2:
+              raise SystemExit(f'expected two paragraph break anchors, found {source.count(para_old)}')
+          source = source.replace(para_old, para_new, 1)
+
+          second_old = '''    for (line_idx, line) in lines.iter().enumerate() {\n        // Page break\n        if line.page != current_page {\n            if current_page > 0 {\n                if in_paragraph {\n                    output.push_str("\\n\\n");\n                    in_paragraph = false;\n                }\n                output.push_str("\\n\\n");\n            }\n            current_page = line.page;\n            prev_y = f32::MAX;\n'''
+          second_new = '''    for (line_idx, line) in lines.iter().enumerate() {\n        let continues_previous_page = line.page != current_page\n            && current_page > 0\n            && !options.include_page_numbers\n            && line_idx > 0\n            && lines_continue_across_page(&lines[line_idx - 1], line, base_size);\n\n        // Page break\n        if line.page != current_page {\n            if current_page > 0 {\n                if in_paragraph && !continues_previous_page {\n                    output.push_str("\\n\\n");\n                    in_paragraph = false;\n                }\n                if !continues_previous_page {\n                    output.push_str("\\n\\n");\n                }\n            }\n            current_page = line.page;\n            prev_y = if continues_previous_page { line.y } else { f32::MAX };\n'''
+          if source.count(second_old) != 1:
+              raise SystemExit('second page-break anchor changed')
+          source = source.replace(second_old, second_new, 1)
+          source = source.replace(para_old, para_new, 1)
+          convert.write_text(source)
+          PY
+          cd /tmp/pdf-candidate
+          cargo fmt --all
+          git diff --check
+
+      - name: Validate candidate source and tests
+        run: |
+          set -euo pipefail
+          cd /tmp/pdf-candidate
+          cargo fmt --all -- --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test --all-targets
+
+      - name: Build paired audit binaries and upstream
+        run: |
+          set -euo pipefail
+          CARGO_TARGET_DIR="$RUNNER_TEMP/baseline-target" cargo build --release --manifest-path /tmp/pdf-baseline/Cargo.toml --bin research-audit
+          CARGO_TARGET_DIR="$RUNNER_TEMP/candidate-target" cargo build --release --manifest-path /tmp/pdf-candidate/Cargo.toml --bin research-audit
+          git clone --depth 1 https://github.com/firecrawl/pdf-inspector.git "$RUNNER_TEMP/upstream"
+          CARGO_TARGET_DIR="$RUNNER_TEMP/upstream-target" cargo build --release --manifest-path "$RUNNER_TEMP/upstream/Cargo.toml" --bin pdf2md
+          echo "BASELINE_BINARY=$RUNNER_TEMP/baseline-target/release/research-audit" >> "$GITHUB_ENV"
+          echo "CANDIDATE_BINARY=$RUNNER_TEMP/candidate-target/release/research-audit" >> "$GITHUB_ENV"
+          echo "UPSTREAM_BINARY=$RUNNER_TEMP/upstream-target/release/pdf2md" >> "$GITHUB_ENV"
+
+      - name: Download one 100-paper source-grounded corpus
+        run: |
+          set -euo pipefail
+          python benchmarks/research_fidelity/audit.py select --arxiv 60 --pmc 40 --out "$RUNNER_TEMP/paragraph-experiment/manifest.json"
+          python benchmarks/research_fidelity/audit.py download --manifest "$RUNNER_TEMP/paragraph-experiment/manifest.json" --root "$RUNNER_TEMP/paragraph-experiment/corpus"
+
+      - name: Evaluate baseline and candidate on identical papers
+        run: |
+          set -euo pipefail
+          python benchmarks/research_fidelity/audit.py evaluate \
+            --manifest "$RUNNER_TEMP/paragraph-experiment/manifest.json" \
+            --root "$RUNNER_TEMP/paragraph-experiment/corpus" \
+            --fork-binary "$BASELINE_BINARY" \
+            --upstream-binary "$UPSTREAM_BINARY" \
+            --out "$RUNNER_TEMP/paragraph-experiment/baseline.jsonl"
+          python benchmarks/research_fidelity/audit.py evaluate \
+            --manifest "$RUNNER_TEMP/paragraph-experiment/manifest.json" \
+            --root "$RUNNER_TEMP/paragraph-experiment/corpus" \
+            --fork-binary "$CANDIDATE_BINARY" \
+            --upstream-binary "$UPSTREAM_BINARY" \
+            --out "$RUNNER_TEMP/paragraph-experiment/candidate.jsonl"
+          python /tmp/compare_candidate.py quality \
+            --baseline "$RUNNER_TEMP/paragraph-experiment/baseline.jsonl" \
+            --candidate "$RUNNER_TEMP/paragraph-experiment/candidate.jsonl" \
+            --out "$RUNNER_TEMP/paragraph-experiment/report/quality.json"
+
+      - name: Run paired 200-page latency gate
+        run: |
+          set -euo pipefail
+          python benchmarks/research_fidelity/audit.py stress \
+            --manifest "$RUNNER_TEMP/paragraph-experiment/manifest.json" \
+            --root "$RUNNER_TEMP/paragraph-experiment/corpus" \
+            --fork-binary "$CANDIDATE_BINARY" \
+            --out-dir "$RUNNER_TEMP/paragraph-experiment/report" \
+            --pages 200 --repeats 1
+          python /tmp/compare_candidate.py latency \
+            --baseline-binary "$BASELINE_BINARY" \
+            --candidate-binary "$CANDIDATE_BINARY" \
+            --pdf "$RUNNER_TEMP/paragraph-experiment/report/research-stress-200p.pdf" \
+            --warmups 2 --rounds 12 --max-ratio 1.01 \
+            --out "$RUNNER_TEMP/paragraph-experiment/report/latency.json"
+          rm -f "$RUNNER_TEMP/paragraph-experiment/report/research-stress-200p.pdf"
+
+      - name: Validate candidate WebAssembly
+        run: |
+          set -euo pipefail
+          cd /tmp/pdf-candidate
+          cargo check --target wasm32-unknown-unknown
+          cargo check --manifest-path wasm/Cargo.toml --target wasm32-unknown-unknown
+          cargo clippy --manifest-path wasm/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
+
+      - name: Upload experiment evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: research-paragraph-experiment-${{ github.run_id }}
+          path: ${{ runner.temp }}/paragraph-experiment/report
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Publish only validated production files to main
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$BASE_SHA"
+          git worktree add --detach /tmp/pdf-release origin/main
+          cp /tmp/pdf-candidate/src/markdown/analysis.rs /tmp/pdf-release/src/markdown/analysis.rs
+          cp /tmp/pdf-candidate/src/markdown/convert.rs /tmp/pdf-release/src/markdown/convert.rs
+          cd /tmp/pdf-release
+          cargo fmt --all
+          git diff --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- src/markdown/analysis.rs src/markdown/convert.rs
+          git commit -m 'fix: preserve paragraphs across research paper page breaks'
+          git push origin HEAD:refs/heads/main
